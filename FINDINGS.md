@@ -212,7 +212,8 @@ Findings:
   dropped) — backtrace capture is future work for the real blame ledger.
 - **RTC RAM survives reflashing too** (power stays up), so the ledger carries a
   build-id (unix-time injected by build.rs) to distinguish fresh-flash from
-  post-panic reboot. Power-cycle behavior (expected: contents lost) not exercised —
+  post-panic reboot. It also survived an external `espflash reset` (boot_count kept
+  incrementing). Power-cycle behavior (expected: contents lost) not exercised —
   the board stayed USB-powered throughout.
 - **Heap numbers** (200KB configured heap, minimal firmware): free=204800 at boot;
   64KB JIT-arena alloc drops it by exactly 65536; largest single block ≈ 204000.
