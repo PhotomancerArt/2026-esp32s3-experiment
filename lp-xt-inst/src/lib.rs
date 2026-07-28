@@ -208,6 +208,10 @@ pub enum NullaryOp {
     Ret,
     Retw,
     Ill,
+    /// `syscall` — raises a system-call exception on hardware; the emulator
+    /// dispatches it to a host `SyscallHandler` (guest ABI, see lp-xt-elf).
+    /// Assembler-verified encoding: `00 50 00`.
+    Syscall,
 }
 
 /// Zero-operand narrow (16-bit) opcodes (`RRRN`, `op0 = 0xD`).

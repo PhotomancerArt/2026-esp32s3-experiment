@@ -11,10 +11,9 @@ members = [
     "xt-runner-client",
     "lp-xt-inst",
     "lp-xt-emu",
-    # more host crates land here as milestones add them:
-    # "lp-xt-elf", "xt-mini-emit"
+    "lp-xt-elf",
 ]
-exclude = ["fw", "oss"]
+exclude = ["fw", "oss", "fixtures"]
 
 [workspace.package]
 edition = "2021"

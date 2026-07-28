@@ -229,6 +229,8 @@ fn decode_st0(w: u32) -> Option<Inst> {
             }
         }
         0x1 => Some(Inst::Rs(AluRs::Movsp, reg_t(w), reg_s(w))),
+        // SYSCALL: r=5, s=0, t=0 (assembler golden bytes `00 50 00`).
+        0x5 if s(w) == 0 && t(w) == 0 => Some(Inst::Nullary(NullaryOp::Syscall)),
         0x2 => {
             // SYNC group: distinguished by t, s must be 0.
             if s(w) != 0 {

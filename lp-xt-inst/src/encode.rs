@@ -320,6 +320,8 @@ pub fn encode(inst: &Inst) -> Vec<u8> {
                 NullaryOp::Ret => pack(0, 0, 0, 0, 0, 0) | (2 << 6),
                 NullaryOp::Retw => pack(0, 0, 0, 0, 0, 0) | (2 << 6) | (1 << 4),
                 NullaryOp::Ill => pack(0, 0, 0, 0, 0, 0),
+                // Assembler golden bytes `00 50 00`: r=5, s=0, t=0.
+                NullaryOp::Syscall => pack(0, 0, 0, 5, 0, 0),
             };
             emit(&mut out, w, 3);
         }

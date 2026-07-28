@@ -135,3 +135,9 @@ fn l32r_target_formula() {
         "l32r\ta0, 0x41fd6198"
     );
 }
+
+/// SYSCALL, assembler-derived (`xtensa-esp32s3-elf-as`: `syscall` -> `00 50 00`).
+#[test]
+fn syscall_golden() {
+    assert_eq!(dec(&[0x00, 0x50, 0x00]).0, Inst::Nullary(NullaryOp::Syscall));
+}

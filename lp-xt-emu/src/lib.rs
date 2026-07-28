@@ -28,6 +28,6 @@ pub mod trace;
 
 mod executor;
 
-pub use emu::{Emulator, RunOutcome};
+pub use emu::{Emulator, RunOutcome, SyscallHandler, SyscallOutcome};
 pub use error::{Trap, TrapKind};
 pub use trace::{NoopTracer, TextTracer, TraceEvent, Tracer};

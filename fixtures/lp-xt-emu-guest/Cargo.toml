@@ -1,0 +1,6 @@
+[package]
+name = "lp-xt-emu-guest"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "no_std guest runtime (entry/print/exit/panic/allocator) for programs running inside lp-xt-emu."

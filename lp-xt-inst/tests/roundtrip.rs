@@ -213,6 +213,7 @@ fn narrow_reg_and_nullary() {
     for op in [
         NullaryOp::Memw, NullaryOp::Extw, NullaryOp::Isync, NullaryOp::Rsync, NullaryOp::Esync,
         NullaryOp::Dsync, NullaryOp::Nop, NullaryOp::Ret, NullaryOp::Retw, NullaryOp::Ill,
+        NullaryOp::Syscall,
     ] {
         rt(Inst::Nullary(op), 3);
     }

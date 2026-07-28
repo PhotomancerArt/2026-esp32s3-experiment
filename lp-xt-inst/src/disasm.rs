@@ -195,6 +195,7 @@ pub fn format_inst(inst: &Inst, pc: u32) -> String {
                 NullaryOp::Ret => "ret",
                 NullaryOp::Retw => "retw",
                 NullaryOp::Ill => "ill",
+                NullaryOp::Syscall => "syscall",
             };
             m.to_string()
         }

@@ -26,3 +26,5 @@ pub struct Trap {
 
 /// EXCCAUSE for an illegal / unsupported instruction (`IllegalInstructionCause`).
 pub const EXC_ILLEGAL_INSTRUCTION: u32 = 0;
+/// EXCCAUSE for a `SYSCALL` with no host handler installed (`SyscallCause`).
+pub const EXC_SYSCALL: u32 = 1;

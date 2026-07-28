@@ -1,0 +1,17 @@
+[package]
+name = "lp-xt-elf"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Xtensa linked-ELF loader + guest-syscall host for lp-xt-emu."
+
+[lints]
+workspace = true
+
+[dependencies]
+lp-xt-emu = { path = "../lp-xt-emu" }
+object = { version = "0.36", default-features = false, features = ["read", "std", "elf"] }
+
+[dev-dependencies]
+lp-xt-inst = { path = "../lp-xt-inst" }

@@ -20,6 +20,11 @@ impl Emulator {
             )
             | Inst::NullaryN(NullaryNarrowOp::NopN) => Ok(Flow::Next),
 
+            // SYSCALL: surface to the run loop, which dispatches to the host
+            // [`SyscallHandler`](crate::SyscallHandler) (or raises SyscallCause
+            // when none is installed, as unhandled hardware would).
+            Inst::Nullary(NullaryOp::Syscall) => Ok(Flow::Syscall),
+
             // ILL / ILL.N: raise an illegal-instruction exception.
             Inst::Nullary(NullaryOp::Ill) | Inst::NullaryN(NullaryNarrowOp::IllN) => Err(Trap {
                 kind: TrapKind::Exception,

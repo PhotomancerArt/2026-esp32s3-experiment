@@ -34,6 +34,37 @@ pub(crate) enum Flow {
     Next,
     /// Jump to an absolute address (branch taken, call, return, jump).
     Jump(u32),
+    /// A `SYSCALL` was executed: hand control to the run loop's
+    /// [`SyscallHandler`] before advancing.
+    Syscall,
+}
+
+/// What [`Emulator::step`] observed (beyond a trap).
+enum Step {
+    /// A normal instruction retired; `pc` already advanced.
+    Normal,
+    /// A `SYSCALL` retired; `pc` still points at it. `next_pc` is the
+    /// instruction after it (where a resumed guest continues).
+    Syscall { next_pc: u32 },
+}
+
+/// How a [`SyscallHandler`] tells the run loop to proceed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SyscallOutcome {
+    /// Write this value to the guest's `a2` and continue after the `SYSCALL`.
+    Resume(u32),
+    /// Stop the run; the value becomes [`RunOutcome::Ok`]. (Guest `exit` — the
+    /// handler records any abnormal detail, e.g. a panic message, itself.)
+    Exit(u32),
+}
+
+/// Host hook invoked when the guest executes a `SYSCALL` instruction.
+///
+/// The guest ABI (which registers carry the syscall number/arguments) is the
+/// handler's business, not the emulator's — the handler gets the full CPU and
+/// memory. `lp-xt-elf` defines the ABI used by the fixture corpus.
+pub trait SyscallHandler {
+    fn syscall(&mut self, cpu: &mut Cpu, mem: &mut Memory) -> SyscallOutcome;
 }
 
 /// A completed run.
@@ -87,7 +118,27 @@ impl Emulator {
         // Load code into SRAM1 at the fixed D-bus base; execute at the alias.
         self.mem.load_bytes(CODE_DBUS_BASE, code);
         let entry = Memory::ibus_alias(CODE_DBUS_BASE).wrapping_add(entry_offset);
+        self.stage_windowed_entry(entry, arg);
+        self.run_loop(tracer, None)
+    }
 
+    /// Run already-loaded code (e.g. ELF segments written into `self.mem` by a
+    /// loader) starting at the I-bus address `entry`, invoked via the same
+    /// synthesized windowed CALL8 as [`run`](Self::run). `SYSCALL` instructions
+    /// are dispatched to `handler`.
+    pub fn run_loaded(
+        &mut self,
+        entry: u32,
+        arg: u32,
+        tracer: &mut dyn Tracer,
+        handler: &mut dyn SyscallHandler,
+    ) -> RunOutcome {
+        self.stage_windowed_entry(entry, arg);
+        self.run_loop(tracer, Some(handler))
+    }
+
+    /// Reset the CPU and stage the synthesized windowed CALL8 into `entry`.
+    fn stage_windowed_entry(&mut self, entry: u32, arg: u32) {
         // Synthesize the caller frame (the runner's context) at base 0 and the
         // CALL8 that jumps into `entry`. A real CALL8 writes the (mangled)
         // return address into the caller's a8 and stages args in a10..; the
@@ -109,11 +160,13 @@ impl Emulator {
         self.cpu.set_a(10, arg); // first argument
         self.cpu.ps_callinc = 2;
         self.cpu.pc = entry;
-
-        self.run_loop(tracer)
     }
 
-    fn run_loop(&mut self, tracer: &mut dyn Tracer) -> RunOutcome {
+    fn run_loop(
+        &mut self,
+        tracer: &mut dyn Tracer,
+        mut handler: Option<&mut dyn SyscallHandler>,
+    ) -> RunOutcome {
         let mut steps = 0u64;
         loop {
             if self.cpu.pc == SENTINEL_PC {
@@ -130,17 +183,39 @@ impl Emulator {
                 });
             }
             steps += 1;
-            if let Err(mut trap) = self.step(tracer) {
-                if trap.pc == 0 {
-                    trap.pc = self.cpu.pc;
+            match self.step(tracer) {
+                Ok(Step::Normal) => {}
+                Ok(Step::Syscall { next_pc }) => match handler.as_mut() {
+                    // No handler: model unhandled hardware behavior (a
+                    // SyscallCause exception at the SYSCALL's pc).
+                    None => {
+                        return RunOutcome::Trap(Trap {
+                            kind: TrapKind::Exception,
+                            cause: crate::error::EXC_SYSCALL,
+                            pc: self.cpu.pc,
+                            vaddr: 0,
+                        })
+                    }
+                    Some(h) => match h.syscall(&mut self.cpu, &mut self.mem) {
+                        SyscallOutcome::Resume(v) => {
+                            self.cpu.set_a(2, v);
+                            self.cpu.pc = next_pc;
+                        }
+                        SyscallOutcome::Exit(code) => return RunOutcome::Ok(code),
+                    },
+                },
+                Err(mut trap) => {
+                    if trap.pc == 0 {
+                        trap.pc = self.cpu.pc;
+                    }
+                    return RunOutcome::Trap(trap);
                 }
-                return RunOutcome::Trap(trap);
             }
         }
     }
 
     /// Fetch, decode, and execute one instruction, updating `pc`.
-    fn step(&mut self, tracer: &mut dyn Tracer) -> Result<(), Trap> {
+    fn step(&mut self, tracer: &mut dyn Tracer) -> Result<Step, Trap> {
         let pc = self.cpu.pc;
         let mut bytes = [0u8; 3];
         let got = self.mem.fetch(pc, &mut bytes)?;
@@ -158,8 +233,14 @@ impl Emulator {
         match self.execute(&inst, pc, tracer)? {
             Flow::Next => self.cpu.pc = pc.wrapping_add(len as u32),
             Flow::Jump(addr) => self.cpu.pc = addr,
+            // Leave pc at the SYSCALL; the run loop advances after dispatch.
+            Flow::Syscall => {
+                return Ok(Step::Syscall {
+                    next_pc: pc.wrapping_add(len as u32),
+                })
+            }
         }
-        Ok(())
+        Ok(Step::Normal)
     }
 
     // --- small shared helpers used by the executor modules ---
