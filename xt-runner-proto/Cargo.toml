@@ -1,0 +1,16 @@
+[package]
+name = "xt-runner-proto"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Wire protocol shared by the xt-runner device firmware and host client."
+
+[features]
+default = []
+# Host side pulls in std for convenience helpers; device stays no_std.
+std = ["postcard/use-std", "serde/std"]
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+postcard = { version = "1", default-features = false, features = ["alloc"] }

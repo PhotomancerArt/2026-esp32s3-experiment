@@ -1,0 +1,16 @@
+[package]
+name = "xt-runner-client"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Host client for the xt-runner ESP32-S3 payload runner."
+
+[dependencies]
+xt-runner-proto = { path = "../xt-runner-proto", features = ["std"] }
+serialport = "4"
+postcard = { version = "1", features = ["use-std"] }
+thiserror = "2"
+
+[lints]
+workspace = true
