@@ -45,6 +45,7 @@ fn main() -> ! {
     );
 
     esp32s3_experiment::e2::run();
+    esp32s3_experiment::e3::run();
 
     loop {
         let delay_start = Instant::now();

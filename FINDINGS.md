@@ -8,7 +8,7 @@ Spike run 2026-07-28 on real hardware. See [README.md](README.md) for context.
 |---|---|---|---|
 | E1 | Toolchain + HAL + USB-Serial-JTAG | **PASS** | [E1](#e1--toolchain-hal-board) |
 | E2 | Execute hand-assembled code from RAM | **PASS** | [E2](#e2--execute-hand-assembled-code-from-ram) |
-| E3 | CALLX8 → Rust builtin + L32R literal pool | pending | |
+| E3 | CALLX8 → Rust builtin + L32R literal pool | **PASS** | [E3](#e3--callx8--rust-builtin--literal-pool) |
 | E4 | Window overflow/underflow under JIT frames | pending | |
 | E5 | Abort-tier recovery + measurements | pending | |
 
@@ -106,7 +106,31 @@ Findings:
 
 ## E3 — CALLX8 → Rust builtin + literal pool
 
-Pending.
+**PASS.** Serial evidence:
+
+```text
+E3A: PASS result=126
+E3: PASS result=126 builtin_addr=0x42016d10 lit_addr=0x3fc8a27c
+```
+
+Findings:
+
+- **The pool-before-code layout works and transfers verbatim**: the reference blob
+  (literal `.word` at +0, code from +4) and the RAM copy share identical relative
+  layout, so the assembler's encoded L32R offset (`81 fe ff`, imm16 = −2 words) runs
+  unchanged from the heap buffer. Runtime patching of the literal slot with the live
+  `spike_builtin` address is the JIT's first "relocation" — trivial.
+- **Argument staging across the rotation confirmed**: caller `a10` → callee `a2` (after
+  callee's ENTRY), return value back in caller `a10`. The emitter's model — "a0–a7
+  preserved, a8–a15 clobbered by a CALLX8, args at a10+" — behaved exactly as documented.
+- **RAM-resident code calling flash-resident code** (0x4037… → 0x4201…) crosses memory
+  regions with no issue.
+- L32R range rule verified concretely: target = `(PC + 3 + (imm16 << 2)) & ~3`,
+  backward-only — pool slots must be ≤ ~256KB behind the referencing instruction and
+  4-byte aligned; pool-at-buffer-start satisfies both for any sane buffer size.
+- Assembler chose wide forms again (`mov a2, a10` emitted as wide `or a2, a10, a10`,
+  3 bytes) — narrow `.n` forms are an optimization the future emitter can ignore
+  initially (density is optional per-instruction).
 
 ## E4 — window overflow/underflow
 
@@ -129,6 +153,20 @@ references, never hand-written.
 22 a0 2a    movi   a2, 42     ; word 0x2aa022 (wide form)
 90 00 00    retw              ; word 0x000090 (wide form)
 ```
+
+### GV2 — `spike_call_blob` (literal pool + CALLX8 builtin call)
+
+```text
++0  xx xx xx xx  .word spike_builtin   ; literal slot, runtime-patched
++4  36 61 00     entry  a1, 48         ; word 0x006136 (imm12 = 48>>3 = 6)
++7  81 fe ff     l32r   a8, <-8>       ; word 0xfffe81 (imm16 = -2 words → slot at +0)
++10 a2 a0 2a     movi   a10, 42        ; word 0x2aa0a2
++13 e0 08 00     callx8 a8             ; word 0x0008e0
++16 a0 2a 20     mov    a2, a10        ; word 0x202aa0 (wide or a2, a10, a10)
++19 90 00 00     retw                  ; word 0x000090
+```
+
+Entry point at +4. L32R target formula: `(PC + 3 + (imm16 << 2)) & ~3`.
 
 ## What this spike did NOT test
 
