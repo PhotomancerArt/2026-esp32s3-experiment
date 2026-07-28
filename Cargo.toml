@@ -10,8 +10,9 @@ members = [
     "xt-runner-proto",
     "xt-runner-client",
     "lp-xt-inst",
+    "lp-xt-emu",
     # more host crates land here as milestones add them:
-    # "lp-xt-emu", "lp-xt-elf", "xt-mini-emit"
+    # "lp-xt-elf", "xt-mini-emit"
 ]
 exclude = ["fw", "oss"]
 

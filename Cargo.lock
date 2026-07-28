@@ -147,6 +147,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lp-xt-emu"
+version = "0.1.0"
+dependencies = [
+ "lp-xt-inst",
+ "xt-runner-client",
+ "xt-runner-proto",
+]
+
+[[package]]
 name = "lp-xt-inst"
 version = "0.1.0"
 dependencies = [

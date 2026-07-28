@@ -1,0 +1,17 @@
+[package]
+name = "lp-xt-emu"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure-Rust Xtensa (ESP32-S3 / LX7) instruction-set emulator core with windowed-register machinery."
+
+[lints]
+workspace = true
+
+[dependencies]
+lp-xt-inst = { path = "../lp-xt-inst" }
+
+[dev-dependencies]
+xt-runner-client = { path = "../xt-runner-client" }
+xt-runner-proto = { path = "../xt-runner-proto" }
