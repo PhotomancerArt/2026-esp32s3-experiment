@@ -7,7 +7,7 @@ Spike run 2026-07-28 on real hardware. See [README.md](README.md) for context.
 | # | Experiment | Verdict | Detail |
 |---|---|---|---|
 | E1 | Toolchain + HAL + USB-Serial-JTAG | **PASS** | [E1](#e1--toolchain-hal-board) |
-| E2 | Execute hand-assembled code from RAM | pending | |
+| E2 | Execute hand-assembled code from RAM | **PASS** | [E2](#e2--execute-hand-assembled-code-from-ram) |
 | E3 | CALLX8 → Rust builtin + L32R literal pool | pending | |
 | E4 | Window overflow/underflow under JIT frames | pending | |
 | E5 | Abort-tier recovery + measurements | pending | |
@@ -68,7 +68,41 @@ spike: idle heap_free=204800
 
 ## E2 — execute hand-assembled code from RAM
 
-Pending.
+**PASS.** Dynamically generated code in a heap buffer executes on ESP32-S3 with no
+special configuration. Serial evidence:
+
+```text
+E2A: PASS value=42
+E2: PASS value=42 write_addr=0x3fc8a25c exec_addr=0x4037a25c barriers=memw+isync
+E2C: PASS value=42 barriers=none
+```
+
+Findings:
+
+- **The SRAM1 dual-mapping works exactly as the memory map says**: write via the D-bus
+  address, execute at `D + 0x6F_0000` (I-bus alias). Constants and range asserts in
+  [src/jitbuf.rs](src/jitbuf.rs); source: esp-hal `ld/esp32s3/memory.x` + S3 TRM.
+  The esp-alloc heap (a static in `dram_seg`) lands in SRAM1, so plain heap allocations
+  are JIT-usable.
+- **No PMS/memprot obstacle** in bare-metal esp-hal (default `esp_hal::init`) with the
+  esp-idf-compat bootloader. Nothing had to be configured or disabled. (ESP-IDF's
+  software memprot is an IDF feature; it simply isn't armed here.)
+- **No cache maintenance required**: E2C executes freshly written bytes with *no*
+  barriers. Internal SRAM is uncached on S3 (cache fronts external flash/PSRAM only).
+  Recommendation for the real emitter: keep one `memw + isync` after emission anyway —
+  cost is nil and it guards buffer-reuse/prefetch edge cases this probe doesn't cover.
+- **E2D (identity-execution probe)**: jumping to the D-bus address faults as expected —
+  `InstrError`, `EXCCAUSE=2` (InstructionFetchError), `EXCVADDR=0x3FC8A274` (the exact
+  D-bus address). esp-hal's exception handler prints a full context dump (all ARs, SAR,
+  EXCCAUSE/EXCVADDR, LBEG/LEND/LCOUNT, FP regs) — good raw material for the future
+  fw-side fault reporting.
+- **Return-address mangling is visible in real backtraces**: the E2D backtrace's last
+  frame prints `0x7fc8a271` — a windowed return address with the top-2-bit window
+  increment still embedded (raw value, un-unmangled by esp-backtrace 0.19). The blame
+  ledger must unmangle (`addr & 0x3FFF_FFFF | region_bits`) before recording PCs.
+- **Lesson reconfirmed**: of 3 hand-written encodings from memory, 2 were wrong
+  (assembler chose wide `movi`/`retw` forms). All golden vectors are objdump-derived,
+  per plan.
 
 ## E3 — CALLX8 → Rust builtin + literal pool
 
@@ -85,7 +119,16 @@ Pending.
 ## Golden vectors
 
 Collected here as they are produced; seed tests for `lp-xtensa-inst` encode/decode and
-emulator conformance.
+emulator conformance. All derived from `xtensa-esp32s3-elf-objdump` of toolchain-assembled
+references, never hand-written.
+
+### GV1 — `spike_stub42` (minimal windowed function)
+
+```text
+36 41 00    entry  a1, 32     ; word 0x004136
+22 a0 2a    movi   a2, 42     ; word 0x2aa022 (wide form)
+90 00 00    retw              ; word 0x000090 (wide form)
+```
 
 ## What this spike did NOT test
 

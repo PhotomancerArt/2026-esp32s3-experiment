@@ -28,6 +28,11 @@ esp-println = { version = "0.17.0", default-features = false, features = [
   "log-04",
 ] }
 
+[features]
+# E2D: deliberately execute at the D-bus address (expected fault); build with
+# --features identity-probe for one sacrificial run to record the exception.
+identity-probe = []
+
 [profile.dev]
 # Rust debug is too slow.
 # For debug builds always builds with some optimization
