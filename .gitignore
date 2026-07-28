@@ -21,3 +21,6 @@ target/
 
 # M4 fixture build artifacts (regenerable via fixtures/build.sh)
 fixtures/elf/
+
+# M6 reloc fixture build artifacts (regenerable via fixtures/reloc/build.sh)
+fixtures/reloc/obj/

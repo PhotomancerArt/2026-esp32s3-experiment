@@ -15,10 +15,11 @@ pub enum ElfError {
         is_64: bool,
         is_little_endian: bool,
     },
-    /// Not a linked executable (e.g. a relocatable `.o`).
+    /// Not a linked executable (e.g. a relocatable `.o` — see the `reloc`
+    /// feature's linker driver for those).
     NotExecutable { kind: String },
     /// The file carries REL/RELA relocation sections. Linked executables are
-    /// pre-resolved; relocation processing is out of scope here (M6).
+    /// pre-resolved; relocation processing lives behind the `reloc` feature.
     HasRelocations { section: String },
     /// A `PT_LOAD` segment's contents could not be read from the file.
     SegmentData { vaddr: u32 },
@@ -42,14 +43,14 @@ impl core::fmt::Display for ElfError {
             ElfError::NotExecutable { kind } => {
                 write!(
                     f,
-                    "not a linked executable (object kind: {kind}); relocatable objects are M6 \
-                     territory"
+                    "not a linked executable (object kind: {kind}); relocatable objects need the \
+                     `reloc` feature's linker driver"
                 )
             }
             ElfError::HasRelocations { section } => write!(
                 f,
                 "ELF has relocations (section {section}); linked-executable loading only — \
-                 relocation processing is M6 territory"
+                 relocation processing lives behind the `reloc` feature"
             ),
             ElfError::SegmentData { vaddr } => {
                 write!(f, "could not read segment data for PT_LOAD at {vaddr:#010x}")
