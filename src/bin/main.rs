@@ -18,8 +18,6 @@ use esp_hal::{
     time::{Duration, Instant},
 };
 
-use esp_backtrace as _;
-
 extern crate alloc;
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
@@ -44,9 +42,19 @@ fn main() -> ! {
         esp_alloc::HEAP.free()
     );
 
+    let boot = esp32s3_experiment::e5::boot_ledger();
+
     esp32s3_experiment::e2::run();
     esp32s3_experiment::e3::run();
     esp32s3_experiment::e4::run();
+    esp32s3_experiment::e5::measure();
+
+    if boot == 1 {
+        // Give the serial monitor a moment, then prove the recovery tier.
+        let delay_start = Instant::now();
+        while delay_start.elapsed() < Duration::from_millis(1500) {}
+        esp32s3_experiment::e5::intentional_panic();
+    }
 
     loop {
         let delay_start = Instant::now();

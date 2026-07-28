@@ -10,7 +10,7 @@ Spike run 2026-07-28 on real hardware. See [README.md](README.md) for context.
 | E2 | Execute hand-assembled code from RAM | **PASS** | [E2](#e2--execute-hand-assembled-code-from-ram) |
 | E3 | CALLX8 → Rust builtin + L32R literal pool | **PASS** | [E3](#e3--callx8--rust-builtin--literal-pool) |
 | E4 | Window overflow/underflow under JIT frames | **PASS** | [E4](#e4--window-overflowunderflow) |
-| E5 | Abort-tier recovery + measurements | pending | |
+| E5 | Abort-tier recovery + measurements | **PASS** | [E5](#e5--recovery-tier--measurements) |
 
 ## Toolchain pins
 
@@ -166,7 +166,41 @@ Findings:
 
 ## E5 — recovery tier + measurements
 
-Pending.
+**PASS** (ledger round-trip) + measurements recorded. Serial evidence (full cycle):
+
+```text
+E5: boot 1 of build 1785267618; will panic intentionally after measurements
+E5: MEASURE heap_free=204800
+E5: MEASURE arena_64k=ok heap_free_after=139264
+E5: MEASURE largest_block~=204000
+PANIC (rebooting, blame recorded): panicked at src/e5.rs:78:5:
+E5 intentional panic (code 0xdead0001)
+rst:0x3 (RTC_SW_SYS_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)
+E5: PASS ledger_survived=true boot_count=2 prev_code=0xdead0001 prev_line=78
+```
+
+Findings:
+
+- **The abort-tier recovery loop works end-to-end**: custom `#[panic_handler]` records
+  blame into RTC fast RAM (`#[esp_hal::ram(unstable(rtc_fast, persistent))]` statics —
+  note the syntax; `Persistable` is implemented for `portable_atomic` types so the
+  ledger is safe atomics, no `static mut`), prints, `esp_hal::system::software_reset()`;
+  next boot reads and reports the prior panic. Replaces esp-backtrace's handler (dep
+  dropped) — backtrace capture is future work for the real blame ledger.
+- **RTC RAM survives reflashing too** (power stays up), so the ledger carries a
+  build-id (unix-time injected by build.rs) to distinguish fresh-flash from
+  post-panic reboot. Power-cycle behavior (expected: contents lost) not exercised —
+  the board stayed USB-powered throughout.
+- **Heap numbers** (200KB configured heap, minimal firmware): free=204800 at boot;
+  64KB JIT-arena alloc drops it by exactly 65536; largest single block ≈ 204000.
+  Nothing else contends for DRAM in this skeleton — the real fw budget question
+  remains open (and is chiefly a *classic*-ESP32 concern).
+- **Flash size**: 95,632 bytes app image (minimal no_std + esp-hal + println + alloc).
+- **Measurement gotcha worth remembering**: with fat LTO, unused alloc/dealloc pairs
+  are *elided* — the first numbers showed a largest-block larger than the heap.
+  `black_box` + a volatile write through the pointer makes the probe real.
+- esp-hal `unstable` feature: required for `system::software_reset` and the `ram`
+  macro options used here (already enabled since P1).
 
 ## Golden vectors
 

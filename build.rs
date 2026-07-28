@@ -2,6 +2,14 @@ fn main() {
     linker_be_nice();
     // make sure linkall.x is the last linker script (otherwise might cause problems with flip-link)
     println!("cargo:rustc-link-arg=-Tlinkall.x");
+
+    // Per-build id so the RTC-RAM ledger (which survives reflashing) can tell
+    // a fresh flash from a post-panic reboot of the same build (see src/e5.rs).
+    let build_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as u32;
+    println!("cargo:rustc-env=SPIKE_BUILD_ID={build_id}");
 }
 
 fn linker_be_nice() {

@@ -17,11 +17,7 @@ log                    = "0.4.27"
 
 critical-section = "1.2.0"
 esp-alloc = { version = "0.10.0", features = ["internal-heap-stats"] }
-esp-backtrace = { version = "0.19.0", features = [
-  "esp32s3",
-  "panic-handler",
-  "println",
-] }
+portable-atomic = { version = "1", default-features = false }
 esp-println = { version = "0.17.0", default-features = false, features = [
   "esp32s3",
   "jtag-serial",
