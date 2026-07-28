@@ -9,7 +9,7 @@ Spike run 2026-07-28 on real hardware. See [README.md](README.md) for context.
 | E1 | Toolchain + HAL + USB-Serial-JTAG | **PASS** | [E1](#e1--toolchain-hal-board) |
 | E2 | Execute hand-assembled code from RAM | **PASS** | [E2](#e2--execute-hand-assembled-code-from-ram) |
 | E3 | CALLX8 → Rust builtin + L32R literal pool | **PASS** | [E3](#e3--callx8--rust-builtin--literal-pool) |
-| E4 | Window overflow/underflow under JIT frames | pending | |
+| E4 | Window overflow/underflow under JIT frames | **PASS** | [E4](#e4--window-overflowunderflow) |
 | E5 | Abort-tier recovery + measurements | pending | |
 
 ## Toolchain pins
@@ -134,7 +134,35 @@ Findings:
 
 ## E4 — window overflow/underflow
 
-Pending.
+**PASS.** Serial evidence:
+
+```text
+E4A: PASS depth=100 result=100 mixed=121 sp=0x3fcdb5f0
+E4: PASS depth=100 result=100 mixed=121
+```
+
+Findings:
+
+- **JIT-emitted frames are first-class citizens of the window machinery.** 100 levels of
+  self-recursion through hand-emitted `ENTRY` frames (≫ the ~8 frames the 64-register
+  file holds) forces many WindowOverflow/Underflow round-trips; `f(depth) == depth`
+  arithmetic — and the mixed Rust → JIT×100 → Rust-builtin chain (`121`) — only survive
+  if every spill/reload of our frames' save areas was correct. Both PASS, first flash.
+- **Vector provenance**: `_WindowOverflow4/8/12` / `_WindowUnderflow*` come from
+  `xtensa-lx-rt 0.22.0` (`src/exception/asm.rs`, pulled in by esp-hal), placed in
+  `vectors_seg` at `0x40378000`. Nothing to install manually.
+- **Frame sizes**: `entry a1, 32` (E4) and `entry a1, 48` (E3) both exercised — the
+  ABI's 16-byte base-save-area minimum is comfortably covered by either.
+- Stack: SP ≈ `0x3fcdb5f0` (top of dram_seg); 100 frames × 32B ≈ 3.2KB used — trivial.
+- **Assembler literal management discovery (design-relevant)**: LLVM MC *deduplicates
+  literals across the object* — the reference blob B's `.word spike_builtin` was elided
+  and its `l32r` rewritten to reference E3's pool, outside the blob. Assembler-produced
+  code is therefore NOT guaranteed self-contained. Consequence for the roadmap: the JIT
+  emitter must own literal-pool layout and encode `l32r` offsets itself (it would
+  anyway); golden vectors for pooled code must be constructed, not copied. The two
+  re-encoded L32Rs in GV3b (computed by hand with the `((PC+3) & !3) + (imm16 << 2)`
+  formula) executing correctly on hardware is itself evidence the formula understanding
+  is right.
 
 ## E5 — recovery tier + measurements
 
@@ -166,7 +194,18 @@ references, never hand-written.
 +19 90 00 00     retw                  ; word 0x000090
 ```
 
-Entry point at +4. L32R target formula: `(PC + 3 + (imm16 << 2)) & ~3`.
+Entry point at +4. L32R target formula: `((PC + 3) & ~3) + (imm16 << 2)`.
+
+### GV3a — `spike_rec` (self-recursive windowed stub, `f(d) = d`)
+
+See `REC_BLOB_BYTES` in [src/e4.rs](src/e4.rs) — verbatim objdump copy (self literal
+at +0, code at +4; `beqz` is blob-internal so it survives copying).
+
+### GV3b — `spike_recb` (mixed: recursion + builtin base case, `f(d) = d + 21`)
+
+See `RECB_BLOB_BYTES` in [src/e4.rs](src/e4.rs) — constructed, not copied: two-slot
+pool (+0 self, +4 builtin), both L32Rs re-encoded by hand (imm16 = −4 and −7) because
+LLVM MC deduped the reference's second literal out of the blob.
 
 ## What this spike did NOT test
 

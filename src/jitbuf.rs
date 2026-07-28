@@ -37,6 +37,15 @@ impl JitBuf {
         self.ptr as usize
     }
 
+    /// Patch a u32 (e.g. a literal-pool slot) in place, via the D-bus address.
+    pub fn patch_u32(&mut self, offset: usize, value: u32) {
+        assert!(offset + 4 <= self.layout.size(), "patch out of bounds");
+        // SAFETY: in-bounds write within our own allocation.
+        unsafe {
+            core::ptr::copy_nonoverlapping(value.to_le_bytes().as_ptr(), self.ptr.add(offset), 4)
+        };
+    }
+
     /// The I-bus alias of this buffer — the address to jump to.
     pub fn exec_addr(&self) -> usize {
         let d = self.ptr as usize;

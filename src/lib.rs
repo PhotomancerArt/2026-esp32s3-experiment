@@ -6,4 +6,5 @@ extern crate alloc;
 
 pub mod e2;
 pub mod e3;
+pub mod e4;
 pub mod jitbuf;
