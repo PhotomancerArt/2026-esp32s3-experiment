@@ -1,0 +1,18 @@
+[package]
+name = "xt-mini-emit"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MiniVInst -> Xtensa emitter prototype."
+
+[lints]
+workspace = true
+
+[dependencies]
+lp-xt-inst = { path = "../lp-xt-inst" }
+
+[dev-dependencies]
+lp-xt-emu = { path = "../lp-xt-emu" }
+xt-runner-client = { path = "../xt-runner-client" }
+xt-runner-proto = { path = "../xt-runner-proto" }
