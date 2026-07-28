@@ -1,2 +1,4 @@
+# Host workspace builds on stable. Device firmware under fw/ overrides this with
+# its own rust-toolchain.toml pinning the Espressif `esp` channel (Xtensa).
 [toolchain]
-channel = "esp"
+channel = "stable"

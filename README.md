@@ -25,6 +25,20 @@ reshape it, on real hardware, in a few days:
 Results live in **[FINDINGS.md](FINDINGS.md)**, including every hand-assembled byte
 sequence as a golden vector for the future `lp-xtensa-inst` / emulator test suites.
 
+## Layout
+
+Two toolchains, split by directory (see [AGENTS.md](AGENTS.md)):
+
+- **Host crates** — root virtual workspace, **stable** Rust (`cargo build` / `cargo
+  test`). `lp-xt-*` crates are destined for the lightplayer monorepo; bare `xt-*` crates
+  are experiment-local scaffolding.
+- **Device firmware** — under `fw/` (e.g. `fw/spike`, the original feasibility firmware),
+  each with its own `rust-toolchain.toml` pinning the Espressif `esp` channel. Excluded
+  from the root workspace; build by `cd`-ing in.
+
+License discipline (no GPL source; Apache LLVM derivation with provenance) is
+non-negotiable — see [the ADR](docs/adr/2026-07-28-license-provenance-discipline.md).
+
 ## Running
 
 Requires [espup](https://github.com/esp-rs/espup) (installs the Xtensa Rust fork — there
@@ -33,7 +47,7 @@ is no upstream rustc target for Xtensa) and espflash, with an ESP32-S3 on USB:
 ```bash
 cargo install espup espflash --locked
 espup install
-cargo run --release   # builds, flashes, opens the monitor
+cd fw/spike && cargo run --release   # builds, flashes, opens the monitor
 ```
 
 Every experiment prints machine-checkable lines: `En: PASS key=value ...`,

@@ -1,45 +1,21 @@
-[package]
-edition      = "2021"
-# Crate named without the year prefix: rustc crate names must be valid
-# identifiers and cannot start with a digit (repo/dir name keeps the year).
-name         = "esp32s3-experiment"
-license      = "MIT"
-rust-version = "1.86"
-version      = "0.1.0"
+# Root virtual workspace — HOST crates only (build on stable Rust).
+#
+# Device firmware lives under fw/ with its own toolchain (rustup `esp` channel)
+# and is EXCLUDED from this workspace. Build device crates by cd-ing into them
+# (their rust-toolchain.toml + .cargo/config.toml select the Xtensa target).
+# See README.md and docs/adr/2026-07-28-license-provenance-discipline.md.
+[workspace]
+resolver = "2"
+members = [
+    # host crates land here as milestones add them:
+    # "lp-xt-inst", "lp-xt-emu", "lp-xt-elf", "xt-runner-client", "xt-mini-emit"
+]
+exclude = ["fw", "oss"]
 
-[[bin]]
-name = "esp32s3-experiment"
-path = "./src/bin/main.rs"
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/PhotomancerArt/2026-esp32s3-experiment"
 
-[dependencies]
-esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"] }
-esp-hal                = { version = "1.1.1", features = ["esp32s3", "log-04", "unstable"] }
-log                    = "0.4.27"
-
-critical-section = "1.2.0"
-esp-alloc = { version = "0.10.0", features = ["internal-heap-stats"] }
-portable-atomic = { version = "1", default-features = false }
-esp-println = { version = "0.17.0", default-features = false, features = [
-  "esp32s3",
-  "jtag-serial",
-  "log-04",
-] }
-
-[features]
-# E2D: deliberately execute at the D-bus address (expected fault); build with
-# --features identity-probe for one sacrificial run to record the exception.
-identity-probe = []
-
-[profile.dev]
-# Rust debug is too slow.
-# For debug builds always builds with some optimization
-opt-level = "s"
-
-[profile.release]
-codegen-units    = 1     # LLVM can perform better optimizations using a single thread
-debug            = 2
-debug-assertions = false
-incremental      = false
-lto              = 'fat'
-opt-level        = 's'
-overflow-checks  = false
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
