@@ -2,6 +2,35 @@
 
 Spike run 2026-07-28 on real hardware. See [README.md](README.md) for context.
 
+## Standalone core (M0–M7) — additional hardware findings
+
+The spike (E1–E5, below) proved feasibility. The standalone core built on it —
+`lp-xt-inst`, `lp-xt-emu`, `lp-xt-elf`, `xt-mini-emit`, `xt-runner` — is all
+hardware-verified; the monorepo seam is in [docs/BACKPORT.md](docs/BACKPORT.md).
+New findings worth carrying:
+
+- **The emulator matches silicon through the window machinery.** Depth-100 `call8`
+  and depth-60 `call12` recursion (many WindowOverflow/Underflow spill/reload
+  round-trips through emitted `ENTRY` frames) produce identical results emu-vs-device.
+  Two window bugs were found by depth-bisection (overflow firing one frame late;
+  per-`WindowBase` save-area table clobbered by base reuse — now driven off a
+  call-stack shadow). See ADR `docs/adr/2026-07-28-emu-window-overflow-direct.md`.
+- **The runner's payload load address depends on the total request-frame length**,
+  not just payload length — the firmware allocates a frame-sized scratch `Vec` before
+  the JIT buffer (`fw/xt-runner/src/main.rs`), so a one-byte-longer postcard `arg`
+  varint moves the buffer. Absolute-address `CALLX8` on device is therefore fragile
+  (a runtime-base-discovery probe works with frame-length parity but is emulator-only
+  in the corpus); PC-relative `CALL8` is the robust device-proven call path.
+- **Immediate legality is per-opcode and unlike RV32**: Xtensa has no `ANDI`/`ORI`/
+  `XORI` (the emitter routes bitwise-immediate through a pooled constant + register
+  op). `imm.rs` must become ISA-parameterized in the backport.
+- **`lp-xt-emu` returns 0 on divide-by-zero; hardware raises `IntegerDivideByZero`.**
+  Unexercised by the corpus (nonzero divisors only); note for the emu's trap parity.
+- Real Rust fixtures compiled by the esp fork use only the supported integer subset —
+  **zero unsupported-instruction traps across 14 fixtures** — so `lp-xt-inst`/`lp-xt-emu`
+  coverage is sufficient for integer code. (objdump FPU-scanning is unreliable: literal
+  pools at the head of `.text` disassemble as FPU garbage; the runtime trap is the gate.)
+
 ## Headline conclusions for the Xtensa roadmap
 
 1. **The S3 JIT memory model is benign**: heap buffer → write via D-bus → execute at

@@ -1,7 +1,26 @@
 # 2026-esp32s3-experiment
 
-A hardware feasibility spike for [lightplayer](https://github.com/light-player)'s planned
-**Xtensa backend**: can lightplayer's JIT-compiled LED shaders run on ESP32-S3?
+A hardware-validated **standalone Xtensa core** for [lightplayer](https://github.com/light-player)'s
+Xtensa backend — plus the feasibility spike that started it. Can lightplayer's
+JIT-compiled LED shaders run on ESP32-S3? Yes: proven end-to-end here, against real silicon.
+
+## The core (built here, backport-ready)
+
+Everything below is verified on a real ESP32-S3 (see [FINDINGS.md](FINDINGS.md) and
+per-crate READMEs); the seam into the monorepo is [docs/BACKPORT.md](docs/BACKPORT.md).
+
+| Crate | What | Verified |
+|---|---|---|
+| `lp-xt-inst` | Xtensa encode / decode / disasm | objdiff: 10,969/10,969 instructions match objdump |
+| `lp-xt-emu` | Pure-Rust emulator + windowed-register machinery | matches hardware through depth-100 window recursion |
+| `lp-xt-elf` | Linked-ELF loader + guest runtime | 14 Rust fixtures run on the emulator |
+| `xt-mini-emit` | MiniVInst → Xtensa emitter (pools, branches, frames) | 60-case corpus agrees emu-vs-silicon |
+| `xt-runner` (+client/proto) | On-device payload runner — send code over USB, no reflash | crash + hang recovery, the hardware oracle |
+
+The two hardest risks of the whole project — the windowed ABI and the espup toolchain —
+are retired.
+
+## The spike (how it started)
 
 ## Why
 
