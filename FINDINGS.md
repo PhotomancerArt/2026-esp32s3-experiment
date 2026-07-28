@@ -2,6 +2,29 @@
 
 Spike run 2026-07-28 on real hardware. See [README.md](README.md) for context.
 
+## Headline conclusions for the Xtensa roadmap
+
+1. **The S3 JIT memory model is benign**: heap buffer → write via D-bus → execute at
+   `+0x6F0000` I-bus alias. No PMS/memprot configuration needed bare-metal, no cache
+   maintenance needed (internal SRAM is uncached). The scary parts of "JIT on Xtensa"
+   are classic-ESP32 concerns, not S3 concerns.
+2. **The windowed ABI behaves exactly as documented** — rotation/arg-staging
+   (a10+→a2+), ENTRY/RETW interop with rustc-emitted callers, and trap-driven
+   spill/reload under hand-emitted frames all verified empirically. The emitter's
+   register model can be "a0–a7 preserved, a8–a15 clobbered, args at a10+."
+3. **The emitter must own literal pools** (it would anyway): LLVM MC dedupes literals
+   across an object, so assembler output isn't self-contained — and the L32R offset
+   formula (`((PC+3) & ~3) + (imm16 << 2)`, backward-only) is hardware-verified via
+   two hand-encoded instances.
+4. **The abort-tier recovery posture is viable**: panic → RTC-RAM ledger → reset →
+   report loop works; esp-backtrace's printed return addresses are still
+   window-mangled, so the real ledger must unmangle PCs.
+5. **Toolchain is workable but old-stable**: a mid-2025 espup fork builds current
+   esp-hal 1.1.1 fine; Xtensa asm requires `#![feature(asm_experimental_arch)]`.
+6. Encodings hand-written from memory were wrong 2 times out of 3 — every golden
+   vector in the future `lp-xtensa-inst` suite must be assembler- or
+   hardware-verified, never trusted from recall.
+
 ## Verdict table
 
 | # | Experiment | Verdict | Detail |

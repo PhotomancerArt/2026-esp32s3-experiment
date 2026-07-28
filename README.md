@@ -41,5 +41,13 @@ Every experiment prints machine-checkable lines: `En: PASS key=value ...`,
 
 ## Status
 
-Spike in progress. This is proof-of-concept code around the compiler/memory-model
-questions only — no LED driving, no comms protocol, no radio.
+**Spike complete — all five experiments PASS on hardware** (ESP32-S3 rev v0.2,
+2026-07-28). Headline: dynamically generated windowed code in a heap buffer executes
+via the SRAM1 I-bus alias with no memory-protection obstacles and no cache maintenance;
+CALLX8 into Rust builtins with runtime-patched literal pools works; window
+overflow/underflow spilling is correct under hand-emitted frames at recursion depth
+100; and a panic=abort + RTC-RAM blame-ledger recovery tier round-trips a real panic.
+See [FINDINGS.md](FINDINGS.md) for details, golden vectors, and gotchas.
+
+This is proof-of-concept code around the compiler/memory-model questions only — no LED
+driving, no comms protocol, no radio.
