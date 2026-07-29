@@ -150,7 +150,9 @@ exclusively; the `CallInc` arithmetic (`arg_base = 4·units + ARG_REGS[0]`, arg
 capacity, save-area bytes) is derived from the same constants, and the dual-run
 corpus staying green through the constants refactor is the proof the model
 describes what already runs on silicon. Nothing in the contract is LX7-only —
-every value carries to LX6 (classic ESP32) unchanged.
+every value carries to LX6 (classic ESP32) unchanged, verified on classic
+silicon by the C3/C4 ladder and the P5 N-run corpus (zero divergences;
+FINDINGS.md, "LX6 conformance").
 
 ## Argument passing and returns (P4)
 
@@ -232,7 +234,11 @@ Provenance: ranges derived from the espressif/llvm-project Xtensa `.td` files
 boundary additionally probed against `xtensa-esp32s3-elf-as` (accepts min/max,
 rejects one step beyond) and round-tripped through `lp-xt-inst` where encoded
 (`tests/imm_legality.rs`, which also pins that the emitter's `add_imm`/`iconst`
-thresholds match the table). Every rule is identical on LX6.
+thresholds match the table). Every rule is identical on LX6 — verified live by
+`tests/imm_gas_lx6.rs`, which re-probes every boundary with both the LX6 and
+LX7 assemblers (`xtensa-esp32-elf-as` / `xtensa-esp32s3-elf-as`) and requires
+identical accept/reject verdicts and byte-identical encodings (171 cases,
+zero differences; skips loudly when the espup toolchain is absent).
 
 ## Icmp branch table
 

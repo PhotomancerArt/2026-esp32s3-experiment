@@ -34,11 +34,22 @@
 //! error or a documented fallback — never silent truncation
 //! ([`lp_xt_inst::encode`] masks fields and does *not* validate).
 //!
-//! ## LX6 (classic ESP32) note
+//! ## LX6 (classic ESP32) note — verified, no longer asserted
 //!
 //! Every rule in this table is identical on LX6 and LX7: the core-ISA
 //! encodings, the Code Density option, and the MUL32/DIV32 options carry the
 //! same immediate fields on both. No entry differs on classic ESP32.
+//!
+//! Evidence (P6, 2026-07-28): every boundary in this table was probed with
+//! BOTH assemblers (`xtensa-esp32-elf-as` for LX6 vs `xtensa-esp32s3-elf-as`
+//! for LX7, `--no-transform`) — 171 cases, identical accept/reject verdicts
+//! and byte-identical encodings, including the absence of `andi`/`ori`/
+//! `xori`, `l32r`'s one-extended backward reach (field 0x7FFF = −131076),
+//! the joint `extui` constraint, `entry`'s frame field, and every branch/
+//! `j`/`call0-12` reach limit. The probe is a live test
+//! (`tests/imm_gas_lx6.rs`, skips loudly without the toolchain). The subset
+//! the emitter exercises also ran divergence-free on classic silicon via the
+//! P5 N-run corpus (FINDINGS.md, "LX6 conformance").
 
 /// How an immediate operand is constrained.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

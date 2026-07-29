@@ -14,10 +14,15 @@
 //! Everything is pinned by `docs/adr/2026-07-28-xtensa-abi-contract.md`,
 //! backed by the P1 silicon measurements (`docs/call-inc-study.md`).
 //!
-//! ## LX6 (classic ESP32) note
+//! ## LX6 (classic ESP32) note — verified, no longer asserted
 //!
 //! No value in this module differs on LX6: the windowed ABI's alignment,
-//! save-area layout, and CALL8 semantics are identical there.
+//! save-area layout, and CALL8 semantics are identical there. Evidence
+//! (2026-07-28): the P5 N-run corpus passed on classic silicon with zero
+//! divergences — window spill/reload to depth 100 (the save-area contract
+//! behind [`FRAME_TOP_RESERVED_BYTES`]), stack args and sret (the P4
+//! conventions behind [`SRET_SCALAR_THRESHOLD`]), and 2-word direct returns
+//! all agree with the S3 (FINDINGS.md, "LX6 conformance").
 
 use crate::emit::CallInc;
 

@@ -168,11 +168,18 @@ the proof the constants describe what already runs on silicon.
 - Staging conflicts for pooled `a10..=a15` members around calls are the
   allocator's existing caller-saved handling (save/restore live vregs) — the same
   contract rv32's `t4..t6` already exercise.
-- **LX6 (classic ESP32) compatibility**: every choice in this contract is core
-  windowed-ABI machinery — CALL8/ENTRY/RETW, the 64-register file, the save-area
-  layout, and all immediate ranges are identical on LX6. Nothing here would
-  differ for the classic-ESP32 fast-follow; the S3-specific parts of the repo
-  (memory map, I/D-bus aliasing) are runner concerns, not ABI concerns.
+- **LX6 (classic ESP32) compatibility — verified on silicon (P5/P6,
+  2026-07-28)**: every choice in this contract is core windowed-ABI machinery —
+  CALL8/ENTRY/RETW, the 64-register file, the save-area layout, and all
+  immediate ranges are identical on LX6. Originally asserted from the ISA, now
+  measured: the full N-run corpus passed on a classic ESP32 v3 with **zero
+  divergences** — including hardware division (LX6 *has* `quos/quou/rems/remu`;
+  div-by-zero traps EXCCAUSE=6; `INT_MIN / -1` wraps, all as on LX7) — and
+  every immediate boundary agrees between the LX6 and LX7 assemblers with
+  byte-identical encodings (`xt-mini-emit/tests/imm_gas_lx6.rs`; FINDINGS.md,
+  "LX6 conformance"). The S3-specific parts of the repo (memory map, I/D-bus
+  aliasing) are runner concerns parameterized by `BoardProfile`, not ABI
+  concerns. FPU remains out of scope on both chips (integer-only).
 
 ## Alternatives considered
 

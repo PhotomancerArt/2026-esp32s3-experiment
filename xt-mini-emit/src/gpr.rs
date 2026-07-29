@@ -17,11 +17,18 @@
 //! rv32 shape); `crate::vinst::PReg` is the newtype MiniVInst carries as an
 //! operand. The backport keeps only this one.
 //!
-//! ## LX6 (classic ESP32) note
+//! ## LX6 (classic ESP32) note — verified, no longer asserted
 //!
 //! Nothing in this module is LX7-specific: the windowed ABI, the 16-register
 //! window over a 64-entry file, and CALL8/ENTRY/RETW semantics are identical
 //! on LX6. Every constant carries over to classic ESP32 unchanged.
+//!
+//! Evidence (2026-07-28): the C3/C4 ladder ran the LX7-assembled golden
+//! vectors byte-for-byte on classic silicon (windowed CALLX8, depth-100
+//! recursion, first spill ~depth 6 per the CALL8 model), and the P5 N-run
+//! corpus — including the call-boundary torture that pins the preserved set
+//! at exactly `a2..a7` and the spill/reload paths at depth — passed on a
+//! classic ESP32 v3 with zero divergences (FINDINGS.md, "LX6 conformance").
 
 /// Physical GPR index (a0–a15).
 pub type PReg = u8;

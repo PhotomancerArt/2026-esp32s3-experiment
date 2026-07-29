@@ -217,7 +217,10 @@ boundary probes, and encoder round-trips. Critical facts for the port:
   beyond that is a documented hard error, MOVSP idiom not implemented.
 
 All immediate rules and register-model choices are **identical on classic ESP32 (LX6)** —
-annotated throughout, so the fast-follow inherits a vetted subset.
+verified, not merely annotated: the full corpus N-ran on classic silicon with zero
+divergences (P5), and every immediate boundary agrees between the LX6 and LX7
+assemblers with byte-identical encodings (P6, live test
+`xt-mini-emit/tests/imm_gas_lx6.rs`; FINDINGS.md, "LX6 conformance").
 
 ## What is NOT proven here (carry as monorepo risk)
 
@@ -226,8 +229,13 @@ annotated throughout, so the fast-follow inherits a vetted subset.
 - Full `InstLog`/trace parity + cycle model (`lp-xt-emu` has hook points only).
 - The `lp-emu-core` extraction itself (monorepo refactor #2 — the prize is ~2× bigger
   now that `profile/` landed in lp-riscv-emu; see readiness report).
-- Classic ESP32 (LX6) — S3 only. Its IRAM/word-access JIT model and RAM footprint are
-  the fast-follow's open questions (the ABI/immediate rules above do carry over).
+- Classic ESP32 (LX6) FPU/timing — the ABI, immediate, and division contract is now
+  silicon-verified on classic (zero corpus divergences; hardware `quos/quou/rems/remu`
+  present — FINDINGS.md, "LX6 conformance") and the code-execution model is established
+  (word-mirrored SRAM1 writer, C2). Still open on classic: the runner firmware's
+  near-cap payload OOM (RX path transiently needs ~3× the payload, so ~33KB payloads
+  panic instead of answering `PayloadTooLarge` — firmware backlog, not an ISA issue),
+  and everything FPU (out of scope repo-wide).
 - Absolute-symbol `CALLX8` on device (emulator-only here; PC-relative `CALL8` is the
   device-proven path; a runtime-base-discovery probe worked but is fragile — see M5).
 - The MOVSP large-frame escape path (frames > 32752 bytes hard-error today).

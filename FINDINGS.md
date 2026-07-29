@@ -515,3 +515,81 @@ dwarf the 8KB RTC-fast ceiling. The runner's code memory abstraction must be
 an I-bus-keyed word writer (the `CodeSpot` shape in
 `fw/spike-esp32/src/codemem.rs`) rather than S3's "alias offset on a heap
 pointer" — that is exactly the per-SOC trait boundary P2 plans for.
+
+# Findings — LX6 conformance (P6)
+
+Adjudicated 2026-07-28 against the classic ESP32 v3, building on the P5 N-run
+harness. Verdict: **every "LX6-identical" annotation held — zero divergences,
+none corrected.** The annotations in `xt-mini-emit/src/{gpr,abi,imm}.rs`, the
+ABI-contract ADR, `docs/BACKPORT.md`, and the xt-mini-emit README are upgraded
+from asserted (ISA-derived) to verified, each citing the evidence below.
+
+## Verified on classic silicon (P5 N-run corpus — zero divergences)
+
+The accumulated dual-run corpus ran emulator-vs-classic-board through
+`xt-testkit` with no disagreement in any world:
+
+- **Instruction/emitter corpus**: arithmetic, pooled constants (`l32r`),
+  loops, branches in both directions, the relaxed long branch (inverted
+  `beqz` over `j`), Select, the full icmp matrix, slots, `call8`, recursion
+  to depth 100, FuelCheck.
+- **Register/ABI contract**: the call-boundary torture — the preserved set is
+  *exactly* `a2..a7` on LX6 too, including through the spill/reload path at
+  depth (the `a_j` survives iff `j < 8` rule).
+- **Window machinery**: spill/reload to depth 100; no spill-slot vs
+  save-area collision (`FRAME_TOP_RESERVED_BYTES = 32` holds); C4's depth
+  sweep matched the CALL8 model (first spill ~depth 6).
+- **Stack args / sret**: the P4 conventions (7th+ args on the stack, sret
+  pointer, 2-word direct returns) behave identically.
+- **Division — the roadmap's biggest suspected divergence, retired**: LX6
+  **has** the hardware divider (`quos/quou/rems/remu`; also confirmed present
+  in the LX6 assembler's core config). Div-by-zero traps `EXCCAUSE=6` and
+  `INT_MIN / -1` wraps without trapping — both exactly as on LX7. No
+  software-division path is needed for classic ESP32.
+
+## Immediate legality: dual-assembler boundary probe (P6's new evidence)
+
+The `imm.rs` table (34 entries) had been probed only against the S3/LX7
+assembler. P6 re-probed **every boundary with both** `xtensa-esp32-elf-as`
+(LX6) and `xtensa-esp32s3-elf-as` (LX7), `--no-transform`, binutils 2.43.1
+(crosstool-NG esp-14.2.0_20240906): **171 cases — zero verdict
+disagreements, zero encoding differences, zero deviations from the table.**
+Now a live test, `xt-mini-emit/tests/imm_gas_lx6.rs` (skips loudly when the
+espup toolchain is absent; `XT_XTENSA_GAS_DIR` overrides the location).
+Load-bearing checks, all identical on both cores:
+
+- `addi`/`addmi`/`movi` (+ density `addi.n`/`movi.n`, incl. `addi.n`'s
+  excluded 0) at min/max/one-beyond; load/store offset scaling for
+  `l8ui`/`l16ui`/`l16si`/`l32i`/`s8i`/`s16i`/`s32i` and the `.n` forms.
+- Branch reach: RRI8 ±128, BRI12 ±2048, `beqz.n`/`bnez.n` forward-only 0..63,
+  `j` ±128KB — probed at the exact displacement with layout padding, both
+  directions.
+- `call0/4/8/12`: ±512KB word-scaled reach and target 4-alignment.
+- `l32r`: backward-only, **one-extended** field — the far half (field 0x7FFF
+  = −131076) and the full −262144 reach assemble identically; forward and
+  beyond-reach rejected identically.
+- `entry`'s frame field (0..32760, multiple of 8); `slli`/`srli`/`srai`/
+  `ssai`/`sext`/`bbci`; `extui` incl. the joint `shift + width <= 32` rule.
+- **`andi`/`ori`/`xori` do not exist on either core** ("unknown opcode" from
+  both assemblers) — the `NoImmForm` entries hold on LX6.
+- `b4const`/`b4constu` membership (incl. 32768/65536 legal, 0/1/32767/65535
+  not).
+- gas's two `slli` quirks are the same on both cores: sa=32 accepted by gas
+  (the table follows LLVM and keeps it illegal — a deliberate conservative
+  subset), sa=0 rejected under `--no-transform`.
+
+## Remains unverified on LX6 (stated, not implied away)
+
+- **FPU** — out of scope repo-wide (integer-only corpus, fixtures, emitter).
+- **Cycle counts / perf model** — out of scope for this repo.
+- Silicon execution covers the corpus's instruction subset; `imm.rs` entries
+  the emitter does not currently emit (e.g. `bbci`, or `sext` at bit
+  positions other than the emitted 7) are assembler- and encoder-verified on
+  both cores but not silicon-executed.
+- Absolute-symbol `CALLX8` on device — still emulator-only on **both** chips
+  (M5 finding, unchanged by this phase).
+- The classic runner firmware's near-cap payload OOM (~33KB payloads panic
+  instead of answering `PayloadTooLarge`) is a known **firmware** backlog bug
+  (RX path transiently needs ~3× the payload), not an ISA divergence; no
+  corpus case comes near it (largest ~2.7KB), so no case was skipped for
+  capacity.
