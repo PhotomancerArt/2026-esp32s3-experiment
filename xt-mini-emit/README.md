@@ -83,14 +83,89 @@ above).
    back in `a10`. Frame = 32 reserved bytes at the top (16-byte base save area +
    16 for `a4..a7` spills under call8) + stack slots growing from `a1+0`, rounded to
    16. `entry`'s immediate caps at 32760 bytes; larger frames need the `movsp` path
-   (not needed here — asserted).
-6. **Call increment: CALL8 by default**, now a parameter (`CallInc`,
+   (not needed here — asserted). All of these register numbers now live in the
+   [ABI contract module](#abi-contract-srcgprrs-srcabirs) — the emitter contains
+   no inline register numbers.
+6. **Call increment: CALL8** (`abi::CALL_INC`, the single source of truth —
+   `CallInc::default()` derives from it), still a parameter (`CallInc`,
    `emit_program_with`) so the same program can be emitted under CALL4/8/12.
    The choice is measurement-backed — preserved-register / register-arg /
    window-overflow tradeoffs on emulator and silicon, including CALL12's 2-arg
    ceiling and CALL4's arg-staging hazard: see
    [docs/call-inc-study.md](docs/call-inc-study.md) (P1 study;
-   `tests/call_inc_study.rs` is the rig).
+   `tests/call_inc_study.rs` is the rig) and the ADR
+   `docs/adr/2026-07-28-xtensa-abi-contract.md` (P2 decision).
+
+## ABI contract (`src/gpr.rs`, `src/abi.rs`)
+
+The hardware-validated register model, in the exact shapes the existing
+`lpvm-native` register allocator consumes. **Backport mapping: `src/gpr.rs` →
+`lpvm-native/src/isa/xt/gpr.rs`, `src/abi.rs` → `lpvm-native/src/isa/xt/abi.rs`**
+— shape-for-shape mirrors of `isa/rv32/{gpr,abi}.rs`, so the move is a file copy
+plus swapping this crate's `PReg` alias for lpvm-native's. The rv32 `abi.rs`
+classification *functions* (`classify_params`/`classify_return`/`func_abi_*`)
+depend on lpvm-native types and are written there against these constants.
+Normative rationale: `docs/adr/2026-07-28-xtensa-abi-contract.md`.
+
+Because a call rotates the register window, caller and callee see different names
+for the same physical registers — every constant states its view; the views
+differ by `CALL_ROTATION` (= 8 under CALL8, asserted in tests):
+
+| Constant | Value | View / role |
+|---|---|---|
+| `RA_REG` / `SP_REG` | `a0` / `a1` | fixed roles; never allocatable |
+| `FP_REG` | = `SP_REG` | **no frame pointer**: `ENTRY` fixes the frame, `a1` is stable, frames are fixed-size |
+| `ARG_REGS` | `a2..=a7` (6) | **callee** view — incoming params, precolor targets |
+| `OUT_ARG_REGS` | `a10..=a15` (6) | **caller** view — what `emit.rs` stages into |
+| `RET_REGS` / `CALL_RET_REGS` | `a2,a3` / `a10,a11` | callee writes / caller reads |
+| `SCRATCH` / `SCRATCH2` | `a8` / `a9` | emitter scratch (the non-staging caller-saved dead zone); excluded from the pool like rv32's t0–t2/t3 |
+| `ALLOC_POOL` | `[a15..a10, a7..a2]` — **12 regs** | vs rv32's 13: near parity. Caller-saved front-loaded (rv32's LRU policy), both banks descending — see the module comment |
+| `CALLER_SAVED_POOL` | `a10..=a15` | measured on silicon: caller `a_j` survives a CALL8 iff `j < 8` |
+| `abi::CALL_INC` | `CallInc::Call8` | the P1/P2 policy decision |
+| `abi::FRAME_TOP_RESERVED_BYTES` | **32** | the one new ISA hook `abi/frame.rs::compute()` needs (rv32 = 0): window save areas at the frame top |
+| `abi::SRET_SCALAR_THRESHOLD` | 2 | same as rv32, deliberately — target-invariant LPIR return classification |
+| `abi::STACK_ALIGNMENT` | 16 | mandated by the windowed ABI (save-area layout assumes it) |
+
+Unlike rv32, the incoming-arg registers **are** pooled: rv32 excludes its arg
+regs because they double as every call's outgoing staging; under CALL8 staging is
+the separate `a10..=a15` bank, so `a2..=a7` are ordinary call-preserved
+temporaries once the precolored params die (and their preservation is *free* —
+window rotation, no prologue save/restore). `emit.rs` consumes these modules
+exclusively; the `CallInc` arithmetic (`arg_base = 4·units + ARG_REGS[0]`, arg
+capacity, save-area bytes) is derived from the same constants, and the dual-run
+corpus staying green through the constants refactor is the proof the model
+describes what already runs on silicon. Nothing in the contract is LX7-only —
+every value carries to LX6 (classic ESP32) unchanged.
+
+## Immediate legality (`src/imm.rs`)
+
+The per-opcode immediate-legality table — the data input for parameterizing
+`lpvm-native/src/imm.rs` by ISA. RV32 has one uniform story (imm12 everywhere);
+Xtensa's legality is **per-opcode**, so the table is keyed by immediate-operand
+class (`ImmOp`), each entry carrying:
+
+- **`ImmRule`** — `Range { min, max, step }` (e.g. `addi` −128..=127; `addmi`
+  multiples of 256 in ±32K; `l32i`/`s32i` offsets unsigned, ≤1020, ×4), a
+  `Set` (the `b4const`/`b4constu` branch-compare lookup tables), or
+  **`NoImmForm`** — the key Xtensa fact that `andi`/`ori`/`xori` do not exist
+  (an explicit entry, not an omission: every bitwise-immediate must materialize
+  the constant);
+- **`PcRel`** — the base a displacement is measured from (`PC+4` for branches
+  and `j`; `(PC&!3)+4` for `call0/4/8/12`; `(PC+3)&!3` for the backward-only
+  `l32r`), so `is_legal` answers "can I reach this target?" in bytes, not raw
+  field values;
+- **`Fallback`** — the documented lowering when a value is illegal
+  (`ConstThenReg`, `AddmiSplit`, `AddressScratch`, `InvertOverJ` relaxation,
+  `IndirectViaL32r`, `OtherOpcode` — e.g. `srli` sa≥16 → `extui` — or
+  `HardError`: never silent truncation; `lp_xt_inst::encode` masks fields and
+  does not validate).
+
+Provenance: ranges derived from the espressif/llvm-project Xtensa `.td` files
+(Apache-2.0 WITH LLVM-exception, provenance header in the file), with every
+boundary additionally probed against `xtensa-esp32s3-elf-as` (accepts min/max,
+rejects one step beyond) and round-tripped through `lp-xt-inst` where encoded
+(`tests/imm_legality.rs`, which also pins that the emitter's `add_imm`/`iconst`
+thresholds match the table). Every rule is identical on LX6.
 
 ## Icmp branch table
 

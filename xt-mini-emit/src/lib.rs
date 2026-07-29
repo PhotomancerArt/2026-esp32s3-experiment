@@ -8,6 +8,11 @@
 //! substitution. See `README.md` for the MiniVInst<->VInst mapping table and
 //! the emitter policy (pool-before-code, backward `L32R`, wide forms only).
 //!
+//! The hardware-validated **ABI contract** lives in [`gpr`] and [`abi`]
+//! (destined for `lpvm-native/src/isa/xt/{gpr,abi}.rs`), with the per-opcode
+//! immediate-legality table in [`imm`]; the emitter consumes those modules
+//! exclusively. Policy + rationale: `docs/adr/2026-07-28-xtensa-abi-contract.md`.
+//!
 //! All machine encodings come from [`lp_xt_inst::encode`] — this crate never
 //! writes instruction bytes by hand. Emitted programs are validated by
 //! dual-running on `lp-xt-emu` and, when `XT_DEVICE_PORT` is set, on a real
@@ -21,7 +26,9 @@
 
 extern crate alloc;
 
+pub mod abi;
 pub mod emit;
+pub mod gpr;
 pub mod imm;
 pub mod vinst;
 

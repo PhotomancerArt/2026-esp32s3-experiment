@@ -25,22 +25,30 @@
 //!   `beqz`/`bnez` signed-12-bit range is relaxed to the inverted branch over
 //!   an unconditional `J` (monotonic short->long, so the loop converges).
 //!
-//! Register model (windowed ABI, hardware-verified):
+//! Register model (windowed ABI, hardware-verified): the emitter consumes
+//! the contract modules [`crate::gpr`] / [`crate::abi`] — every register
+//! number below comes from there (the coherence proof that the contract
+//! describes what actually runs on silicon).
 //!
 //! - We are a windowed callee: one `ENTRY a1, frame` prologue, `RETW`
-//!   epilogue. Our argument arrives in `a2`; our result is returned in `a2`.
-//! - `a0`/`a1` are return-address/SP. Program registers are `a2..=a7`.
-//! - `a8`/`a9` are emitter scratch.
-//! - The **call increment** ([`CallInc`], default `CALL8`) picks the rest:
-//!   which program registers survive our own calls, where outgoing arguments
-//!   are staged (callee `a2..` = caller `a[4*inc]+2..`), and where a call's
-//!   result comes back (caller `a[4*inc + 2]`). Under `CALL8` that is the
-//!   M5 layout: `a2..=a7` all survive, args stage at `a10..=a15`, result in
-//!   `a10`. See `docs/call-inc-study.md` for the measured tradeoff.
+//!   epilogue. Our argument arrives in `gpr::ARG_REGS[0]` (a2); our result
+//!   is returned in `gpr::RET_REGS[0]` (a2).
+//! - `gpr::RA_REG`/`gpr::SP_REG` are return-address/SP. Program registers
+//!   are the preserved bank `gpr::ARG_REGS` (a2..=a7).
+//! - `gpr::SCRATCH`/`gpr::SCRATCH2` (a8/a9) are emitter scratch.
+//! - The **call increment** ([`CallInc`], default [`crate::abi::CALL_INC`] =
+//!   `CALL8`) picks the rest: which program registers survive our own calls,
+//!   where outgoing arguments are staged (callee `a2..` = caller
+//!   `a[4*inc]+2..`), and where a call's result comes back (caller
+//!   `a[4*inc + 2]`). Under `CALL8` that is the M5 layout: `a2..=a7` all
+//!   survive, args stage at `gpr::OUT_ARG_REGS` (a10..=a15), result in
+//!   `gpr::CALL_RET_REGS[0]` (a10). See `docs/call-inc-study.md` for the
+//!   measured tradeoff.
 //! - Frame: `ENTRY` needs a 16-byte base save area at the frame top, plus
 //!   16 bytes per additional window unit for the `a4..` spills written by
 //!   `_WindowOverflow{8,12}` — the top [`CallInc::save_area_bytes`] of the
-//!   frame are reserved and stack slots grow from `a1 + 0` upward.
+//!   frame (= [`crate::abi::FRAME_TOP_RESERVED_BYTES`] under the default
+//!   policy) are reserved and stack slots grow from `a1 + 0` upward.
 
 extern crate alloc;
 
@@ -52,13 +60,18 @@ use lp_xt_inst::{
     NullaryOp, Reg, ShiftSetOp, StoreOp,
 };
 
+use crate::gpr;
 use crate::vinst::{
     AluImmOp, AluOp, Callee, IcmpCond, LabelId, MiniFunc, MiniProgram, MiniVInst, PReg, SymbolId,
 };
 
-/// Emitter scratch registers (never available to MiniVInst programs).
-const SCRATCH0: Reg = Reg::new(8);
-const SCRATCH1: Reg = Reg::new(9);
+/// Emitter scratch registers (never available to MiniVInst programs) —
+/// [`gpr::SCRATCH`]/[`gpr::SCRATCH2`] as encoder operands.
+const SCRATCH0: Reg = Reg::new(gpr::SCRATCH);
+const SCRATCH1: Reg = Reg::new(gpr::SCRATCH2);
+
+/// The stack pointer as an encoder operand ([`gpr::SP_REG`]).
+const SP: Reg = Reg::new(gpr::SP_REG);
 
 /// The windowed call increment the emitter uses for every call it produces.
 ///
@@ -77,17 +90,23 @@ const SCRATCH1: Reg = Reg::new(9);
 ///   window-overflow traps start spilling.
 ///
 /// Measured tradeoff (emulator + ESP32-S3): `docs/call-inc-study.md`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CallInc {
     /// `CALL4`: 2 preserved program registers, 6 register args, ~cheapest
     /// window pressure.
     Call4,
-    /// `CALL8`: 6 preserved program registers, 6 register args. The default
-    /// (the hardware-proven M5 layout).
-    #[default]
+    /// `CALL8`: 6 preserved program registers, 6 register args. The policy
+    /// choice ([`crate::abi::CALL_INC`], the hardware-proven M5 layout).
     Call8,
     /// `CALL12`: 10 preserved registers, but only **2** register args.
     Call12,
+}
+
+impl Default for CallInc {
+    /// The ABI policy constant — `abi.rs` is the single source of truth.
+    fn default() -> Self {
+        crate::abi::CALL_INC
+    }
 }
 
 impl CallInc {
@@ -100,20 +119,23 @@ impl CallInc {
         }
     }
 
-    /// Caller register that maps to the callee's `a2` (first argument out,
-    /// and where the callee's return value lands).
+    /// Caller register that maps to the callee's first argument register
+    /// [`gpr::ARG_REGS`]`[0]` (first argument out, and where the callee's
+    /// return value lands). Under the default policy this is
+    /// [`gpr::OUT_ARG_REGS`]`[0]` (asserted in gpr's tests).
     pub const fn arg_base(self) -> u8 {
-        4 * self.units() + 2
+        4 * self.units() + gpr::ARG_REGS[0]
     }
 
-    /// Register-argument capacity: the callee reads args from its `a2..=a7`,
-    /// but the caller can only stage into its own window (`a15` max), so
-    /// capacity = `min(6, 16 - arg_base)` — 6 for CALL4/CALL8, **2** for
+    /// Register-argument capacity: the callee reads args from its
+    /// [`gpr::ARG_REGS`] (`a2..=a7`), but the caller can only stage into its
+    /// own window (`a15` max), so capacity =
+    /// `min(ARG_REGS.len(), 16 - arg_base)` — 6 for CALL4/CALL8, **2** for
     /// CALL12.
     pub const fn max_reg_args(self) -> usize {
         let cap = (16 - self.arg_base()) as usize;
-        if cap > 6 {
-            6
+        if cap > gpr::ARG_REGS.len() {
+            gpr::ARG_REGS.len()
         } else {
             cap
         }
@@ -131,8 +153,10 @@ impl CallInc {
     /// the hardware handlers and lp-xt-emu's save-area model, and frame size
     /// does not affect window-overflow onset.)
     pub const fn save_area_bytes(self) -> u32 {
+        // Floor at CALL8's units: the runner enters payloads via CALL8.
+        let floor = CallInc::Call8.units();
         let u = self.units();
-        let u = if u < 2 { 2 } else { u };
+        let u = if u < floor { floor } else { u };
         16 * u as u32
     }
 
@@ -339,10 +363,14 @@ impl Emitter {
 
     // --- register checking -------------------------------------------------
 
-    /// Convert a program register, enforcing the `a2..=a7` contract.
+    /// Convert a program register, enforcing the preserved-bank contract:
+    /// MiniVInst programs use only [`gpr::ALLOC_POOL`]'s call-preserved bank
+    /// (`a2..=a7`) — this mini emitter uses the caller-saved bank for call
+    /// staging instead of allocating it (the full backend pools it too and
+    /// resolves staging conflicts in regalloc).
     fn r(&self, p: PReg) -> Reg {
         assert!(
-            (2..=7).contains(&p.num()),
+            gpr::is_callee_saved_pool(p.num()),
             "MiniVInst register {p:?} outside the program range a2..=a7"
         );
         Reg::new(p.num())
@@ -368,9 +396,10 @@ impl Emitter {
             .last()
             .zip(f.slots.last())
             .map_or(0, |(&o, &s)| o + s.div_ceil(4) * 4);
-        let frame = (self.inc.save_area_bytes() + slots_bytes).div_ceil(16) * 16;
+        let align = crate::abi::STACK_ALIGNMENT;
+        let frame = (self.inc.save_area_bytes() + slots_bytes).div_ceil(align) * align;
         assert!(frame <= 32760, "frame too large for ENTRY immediate");
-        self.inst(Inst::Entry(Reg::new(1), frame));
+        self.inst(Inst::Entry(SP, frame));
 
         for inst in &f.insts {
             self.lower_inst(idx, inst, &slot_offsets);
@@ -472,7 +501,7 @@ impl Emitter {
                 let off = *slot_offsets
                     .get(*slot as usize)
                     .unwrap_or_else(|| panic!("SlotAddr: slot {slot} not declared"));
-                self.add_imm(d, Reg::new(1), off as i32);
+                self.add_imm(d, SP, off as i32);
             }
             MiniVInst::IConst32 { dst, val } => {
                 let d = self.r(*dst);
@@ -486,19 +515,21 @@ impl Emitter {
                     inc.max_reg_args(),
                     args.len()
                 );
-                // Stage args at the increment's staging area. Under CALL8/12
+                // Stage args at the increment's staging area (under the
+                // default CALL8 policy: gpr::OUT_ARG_REGS). Under CALL8/12
                 // the staging registers (a10+/a14+) never alias the a2..=a7
-                // sources; under CALL4 the area is a6..a11, so the a6/a7
-                // dests would clobber still-unread sources — bounce those two
-                // through a12/a13 (free: above the CALL4 staging area, below
-                // nothing live) and write them last.
+                // sources; under CALL4 the area is a6..a11, so dests inside
+                // the program bank (a6/a7) would clobber still-unread
+                // sources — bounce those through the registers just above
+                // the 6-slot staging area (a12/a13 for CALL4: free — above
+                // staging, below nothing live) and write them last.
                 let base = inc.arg_base();
                 let mut bounced: [Option<(u8, u8)>; 2] = [None; 2];
                 for (i, a) in args.iter().enumerate() {
                     let s = self.r(*a);
                     let dest = base + i as u8;
-                    if dest <= 7 {
-                        let tmp = 12 + i as u8;
+                    if gpr::is_callee_saved_pool(dest) {
+                        let tmp = base + gpr::ARG_REGS.len() as u8 + i as u8;
                         self.mov(Reg::new(tmp), s);
                         bounced[i] = Some((dest, tmp));
                     } else {
@@ -520,6 +551,8 @@ impl Emitter {
                     }
                 }
                 if let Some(rr) = ret {
+                    // The callee's RET_REGS[0] rotates back to caller
+                    // `arg_base` (= gpr::CALL_RET_REGS[0] under CALL8).
                     let d = self.r(*rr);
                     self.mov(d, Reg::new(base));
                 }
@@ -527,7 +560,7 @@ impl Emitter {
             MiniVInst::Ret { val } => {
                 if let Some(v) = val {
                     let s = self.r(*v);
-                    self.mov(Reg::new(2), s);
+                    self.mov(Reg::new(gpr::RET_REGS[0]), s);
                 }
                 self.inst(Inst::Nullary(NullaryOp::Retw));
             }
