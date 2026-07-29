@@ -35,13 +35,14 @@ VInsts whose operands are physical registers. MiniVInst models that input direct
 | `BrIf { cond, target, invert }` | same shape | `bnez`/`beqz` (BRI12, ±2 KB); out-of-range → inverted branch over `j` (relaxation). |
 | `Mov { dst, src }` | same shape | Wide `or dst, src, src` (what the assembler emits for `mov`). |
 | `Load32 / Store32 / Store8 / Store16 { …, base, offset }` | same shape | `l32i`/`s32i`/`s8i`/`s16i`. Negative/out-of-range offsets fold into scratch (`base+off` then offset 0). |
-| `Load8U / Load8S / Load16U / Load16S` | *not mirrored* | Same pattern as Load32 (`l8ui`, `l16ui`, `l16si`; `Load8S` = `l8ui` + `sext …,7`). Omitted from the mini set; nothing new to prove. |
-| `Neg / Bnot` | *not mirrored* | Trivial: `neg` exists as an RRR-form (`AluRt::Neg`); `bnot` = materialize −1 + `xor`. |
-| `MemcpyWords` | *not mirrored* | A loop over `l32i`/`s32i`; composed of pieces proven here. |
+| `Load8U / Load8S / Load16U / Load16S` | same shape | **Implemented + dual-run tested** (P6b, `tests/p6_emitter_completion.rs`): `l8ui`, `l16ui`, `l16si`; `Load8S` = `l8ui` + `sext …,7` (no `l8si` exists). Offsets gated per opcode (`0..=255` / `0..=510`×2), scratch fallback beyond. |
+| `Neg / Bnot` | same shape | **Implemented + dual-run tested** (P6b): `neg` is a native RRR-form (`AluRt::Neg`); `bnot` = materialize −1 + `xor` (no not/xor-immediate — `ImmRule::NoImmForm`). |
+| `MemcpyWords { dst_base, src_base, size }` | same shape | **Implemented + dual-run tested** (P6b): unrolled `l32i`/`s32i` pairs through scratch; copies past the 1020-byte offset ceiling bump both bases in ≤1024-byte chunks and restore them exactly (base regs observably unchanged — pinned by test). Word-multiple sizes only; size 0 and self-copy are no-ops. |
 | `SlotAddr { dst, slot }` | same shape | `dst = a1 + slot_offset` (`addi`/`addmi`). Slot layout: see frame model below. |
 | `IConst32 { dst, val }` | same shape | `movi` for −2048..=2047, else pooled `l32r`. |
-| `Call { target: SymbolId, args: VRegSlice, rets, …sret flags }` | `Call { callee: Callee, args: Vec<PReg>, ret: Option<PReg> }` | Post-regalloc: args/ret are physical regs. `Callee::Sym` is the real path (pooled absolute address + `callx8` — the monorepo links builtin addresses into the pool the same way); `Callee::Func` (PC-relative `call8` to a function in the same buffer) exists so call tests are position-independent and can dual-run on hardware. The sret-plumbing flags don't apply to the single-scalar mini ABI — **backport note**: multi-value returns land in `a10, a11, …` (callee `a2, a3, …`); nothing about the window rotation changes. |
-| `Ret { vals: VRegSlice }` | `Ret { val: Option<PReg> }` | `mov a2, val` + `retw`. Multi-value: `a2..`. |
+| `Call { target: SymbolId, args: VRegSlice, rets, …sret flags }` | `Call { callee, args, ret: Option<PReg> }` **and** `CallMulti { callee, args, rets: Vec<PReg> }` | Post-regalloc: args/rets are physical regs. `Callee::Sym` is the real path (pooled absolute address + `callx8` — the monorepo links builtin addresses into the pool the same way); `Callee::Func` (PC-relative `call8` to a function in the same buffer) exists so call tests are position-independent and can dual-run on hardware. `CallMulti` is the full mirror (P4): **stack-passed args** past the 6-register capacity and up to 2 direct return words (caller `a10, a11`); the legacy `Call` keeps the M5 register-only contract pinned by the P1 arg-capacity study. See [Argument passing and returns](#argument-passing-and-returns-p4). |
+| `Ret { vals: VRegSlice }` | `Ret { val: Option<PReg> }` and `RetMulti { vals: Vec<PReg> }` | `mov a2, val` + `retw`; two-word returns write `a2, a3` (`RET_REGS`) with clobber-free ordering (a `[a3, a2]` swap bounces through scratch). > 2 words refuse to emit — sret buffer instead. |
+| `Edit::LoadIncomingArg { fp_offset, to }` (regalloc edit) | `IncomingStackArg { dst, index }` | Callee-side read of a stack-passed incoming arg: `l32i dst, a1, frame + 4*(index - 6)` — callee `SP + ENTRY frame` **is** the caller's SP. |
 | `Label(LabelId, src_op)` | `Label(LabelId)` | Zero-size layout item. |
 | `FuelCheck { vmctx, decrement, trap_label }` | `FuelCheck { fuel_base, decrement, trap_label }` | Full expansion, not a stub: `l32i scratch,[base]; beqz scratch→trap; (addi −1; s32i)`. `fuel_base` stands in for vmctx (the counter is the vmctx low fuel word); check-then-decrement ordering matches the real semantics. |
 
@@ -56,9 +57,14 @@ above).
 
 1. **Pool-before-code.** Buffer layout is
    `[literal pool][func0: entry][func1]…`; `entry_offset` = pool size. `l32r` reaches
-   literals **backward only** (`target = ((PC+3) & !3) + (imm16 << 2)`,
+   literals **backward only** (`target = ((PC+3) & !3) + (one_extend(imm16) << 2)`,
    hardware-verified), so pool-at-start is reachable from the first ~256 KB of code and
-   needs no mid-stream pool islands. Literals are deduplicated by value (symbol slots
+   needs no mid-stream pool islands. The 16-bit field is **one-extended** (value =
+   field − 0x10000): the full displacement range is −262144..=−4 bytes, and field
+   values `0x0000..0x7FFF` reach the *farther* 128 KiB — the emitter's original assert
+   used the sign-extended half range (−131072..), the bug the P6 imm-table work found;
+   fixed and boundary-tested (`tests/p6_emitter_completion.rs`, fields
+   `0x8000`/`0x7FFF`/`0x0000` at −131072/−131076/−262144, refusal at −262148). Literals are deduplicated by value (symbol slots
    by id) *within the buffer we own* — the spike showed assembler output dedups across
    an object and is therefore not self-contained; the emitter owning the pool is what
    makes the buffer relocatable as a unit.
@@ -80,12 +86,21 @@ above).
    `entry a1, frame` prologue, `retw` epilogue; argument in `a2`, result in `a2`.
    Program registers `a2..=a7` (preserved across our calls by the rotation);
    `a8`/`a9` emitter scratch; `a10..=a15` outgoing args (callee's `a2..=a7`), result
-   back in `a10`. Frame = 32 reserved bytes at the top (16-byte base save area +
-   16 for `a4..a7` spills under call8) + stack slots growing from `a1+0`, rounded to
-   16. `entry`'s immediate caps at 32760 bytes; larger frames need the `movsp` path
-   (not needed here — asserted). All of these register numbers now live in the
+   back in `a10`. Frame, from `a1+0` upward: **outgoing stack-arg area** (P4; sized
+   for the call with the most stack-passed args, 0 when none), then stack slots, then
+   the 32 reserved bytes at the top (16-byte base save area + 16 for `a4..a7` spills
+   under call8), rounded to 16. **Large frames**: `entry`'s immediate caps at 32760
+   bytes (imm12 × 8); with 16-byte rounding the largest emittable frame is **32752**
+   (slot + out-arg bytes ≤ 32720). Beyond that the emitter raises a **documented hard
+   error** naming the limit — deliberately *not* the `movsp` dynamic-frame idiom
+   (policy pinned in the P2 ADR: LPIR has no alloca and no frame that large; `movsp`
+   would add save-area-relocation semantics for an unreachable case). Both sides of
+   the boundary are tested (`p6_entry_frame_boundary`: 32752 emits and runs, 32768
+   refuses; `lp_xt_inst::encode` would have silently truncated to `entry a1, 0`).
+   All of these register numbers live in the
    [ABI contract module](#abi-contract-srcgprrs-srcabirs) — the emitter contains
-   no inline register numbers.
+   no inline register numbers — and every immediate field is gated through the
+   [legality table](#immediate-legality-srcimmrs) before encoding.
 6. **Call increment: CALL8** (`abi::CALL_INC`, the single source of truth —
    `CallInc::default()` derives from it), still a parameter (`CallInc`,
    `emit_program_with`) so the same program can be emitted under CALL4/8/12.
@@ -136,6 +151,58 @@ capacity, save-area bytes) is derived from the same constants, and the dual-run
 corpus staying green through the constants refactor is the proof the model
 describes what already runs on silicon. Nothing in the contract is LX7-only —
 every value carries to LX6 (classic ESP32) unchanged.
+
+## Argument passing and returns (P4)
+
+The complete calling convention for calls that exceed the register contract,
+validated dual-run (`tests/p4_stack_args.rs`) and **matched against the esp
+toolchain as the behavioral oracle** — `fixtures/elf/call_conv.elf` (`many`,
+`make_quad`, disassembled with `xtensa-esp32s3-elf-objdump`) — rather than
+invented. No divergence from the oracle's convention was needed.
+
+**Stack-passed arguments** (args 7+ under CALL8's 6-register capacity):
+
+- The caller stores arg `i >= 6` at `[caller_SP + 4*(i - 6)]` — the **bottom
+  of its own frame** (the outgoing-arg area, below its slots). Oracle: `main`
+  stores args 7/8 of `many(…)` at `s32i a1, 0` / `s32i a1, 4`.
+- The callee reads it at `[callee_SP + callee_frame + 4*(i - 6)]`, because
+  `callee SP + ENTRY frame == caller SP`. Oracle: `many` (frame 32) reads
+  `l32i a1, 32` / `l32i a1, 36`.
+- This is the same region order as rv32's `abi/frame.rs::compute()`
+  (`caller_arg_stack_size` at `[SP, SP+size)`, spills/slots above). The
+  callee's own reserved save-area top (`[caller_SP - 32, caller_SP)`) sits
+  directly below the caller's outgoing args — adjacent, never overlapping;
+  the deep-recursion P4 case keeps stack args + sret buffers live while the
+  window file wraps and spills around both.
+
+**Returns**:
+
+- 1–2 scalars: direct in callee `a2(, a3)` → caller `a10(, a11)` —
+  `RET_REGS` / `CALL_RET_REGS`. Two-word returns are hardware-shape-tested
+  including the full-swap staging case (`[a3, a2]` bounces through scratch).
+- \> `SRET_SCALAR_THRESHOLD` (= 2) scalars: **sret buffer** — the caller
+  allocates the buffer in its own frame (a slot) and passes its address as
+  the **first** argument (callee `a2`); the callee stores through it and
+  returns nothing in registers. Oracle: `make_quad` receives the pointer in
+  `a2` and writes `a2+0..12`. Three direct return words refuse to emit
+  (pinned by test) — the threshold is a hard boundary, not a soft preference.
+
+**The `IsaTarget`-shaped rules** (what the monorepo's `isa/xt` arm returns —
+pinned by `p4_isa_target_shaped_rules`):
+
+| `IsaTarget` method | Xtensa value |
+|---|---|
+| `call_arg_reg_count()` | 6 (`ARG_REGS`, callee `a2..=a7`) |
+| `call_arg_reg_hw(i)` | `ARG_REGS[i]` (precolor view; caller stages `OUT_ARG_REGS[i]`) |
+| `direct_ret_reg_count()` | 2 (`RET_REGS` = `a2, a3`) |
+| `sret_uses_buffer_for(n)` | `n > SRET_SCALAR_THRESHOLD` (= 2) |
+| `lpir_call_stack_args_start(uses_sret, caller_passes_ptr)` | `6`, or `5` when `uses_sret && !caller_passes_ptr` (the emitter-injected sret pointer occupies `ARG_REGS[0]` — same formula as rv32 with 6 arg regs) |
+| `lpir_call_arg_target_hw(…)` | rv32's sret-swap logic unchanged over `ARG_REGS` — the window rotation is invisible to the slot mapping (the emitter translates callee-view `ARG_REGS[k]` to caller staging `OUT_ARG_REGS[k]` mechanically) |
+| `stack_alignment()` | 16 |
+
+Plus the frame hook: `abi/frame.rs::compute()` places the outgoing-arg area
+at `[SP, SP+size)` exactly as on rv32; the only Xtensa addition remains
+`FRAME_TOP_RESERVED_BYTES = 32` at the frame top.
 
 ## Immediate legality (`src/imm.rs`)
 
@@ -194,6 +261,19 @@ thresholds match the table). Every rule is identical on LX6.
   (absolute addresses are unknowable pre-load on the device; hardware call coverage
   comes from the position-independent `call8` case) and exercises the same sym-slot
   linking flow the monorepo will use for builtin addresses.
+- `tests/p4_stack_args.rs` (P4) dual-runs the argument/return convention: the
+  8-arg oracle shape (2 stack-passed, weighted so any slot/offset mixup changes the
+  result), 2-word direct returns (including the swap-staging case), the vec4-shaped
+  sret buffer, and a deep recursion (depths 0–30, past the measured overflow onset at
+  6) that keeps stack args, sret buffers, and saved slots live while windows spill —
+  with a tracer assertion that spills actually happen. Threshold refusals (3 direct
+  return words) and the CALL12 3-args-via-stack escape are emit-level tests.
+- `tests/p6_emitter_completion.rs` (P6b) dual-runs the extending loads (sign bits
+  probed in every byte/half position), Neg/Bnot, MemcpyWords (1056 bytes = two
+  chunks, base-restoration verified observably), and a 2 KiB frame; emit-level
+  boundary tests pin the ENTRY frame ceiling (32752 runs / 32768 refuses with the
+  documented error) and the L32R one-extended displacement rule at all four
+  boundary fields.
 - The oracle earns its keep: an early revision of the fuel test read a register never
   written on one path — invisible on the emulator (zeroed registers), caught
   immediately by real silicon.

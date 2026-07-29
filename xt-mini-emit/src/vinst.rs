@@ -167,27 +167,89 @@ pub enum MiniVInst {
     Mov { dst: PReg, src: PReg },
     /// Word load `dst = [base + offset]` — mirrors `VInst::Load32`.
     Load32 { dst: PReg, base: PReg, offset: i32 },
+    /// Zero-extending byte load — mirrors `VInst::Load8U` (`l8ui`).
+    Load8U { dst: PReg, base: PReg, offset: i32 },
+    /// Sign-extending byte load — mirrors `VInst::Load8S`. Xtensa has no
+    /// `l8si`: lowered as `l8ui` + `sext dst, dst, 7`.
+    Load8S { dst: PReg, base: PReg, offset: i32 },
+    /// Zero-extending halfword load — mirrors `VInst::Load16U` (`l16ui`).
+    Load16U { dst: PReg, base: PReg, offset: i32 },
+    /// Sign-extending halfword load — mirrors `VInst::Load16S` (`l16si`).
+    Load16S { dst: PReg, base: PReg, offset: i32 },
     /// Word store `[base + offset] = src` — mirrors `VInst::Store32`.
     Store32 { src: PReg, base: PReg, offset: i32 },
     /// Byte store (low 8 bits) — mirrors `VInst::Store8`.
     Store8 { src: PReg, base: PReg, offset: i32 },
     /// Halfword store (low 16 bits) — mirrors `VInst::Store16`.
     Store16 { src: PReg, base: PReg, offset: i32 },
+    /// `dst = -src` — mirrors `VInst::Neg` (Xtensa `neg`, a native RRR-form).
+    Neg { dst: PReg, src: PReg },
+    /// `dst = !src` (bitwise not) — mirrors `VInst::Bnot`. Xtensa has no
+    /// `not`: lowered as `movi scratch, -1; xor dst, src, scratch`.
+    Bnot { dst: PReg, src: PReg },
+    /// Word-granular copy of `size` bytes (`size % 4 == 0`) from `[src_base]`
+    /// to `[dst_base]` — mirrors `VInst::MemcpyWords { dst_base, src_base,
+    /// size }`. Lowered as unrolled `l32i`/`s32i` pairs through scratch;
+    /// blocks past the 1020-byte offset range bump both base registers in
+    /// chunks and restore them exactly afterward (bases read back unchanged).
+    MemcpyWords {
+        dst_base: PReg,
+        src_base: PReg,
+        size: u32,
+    },
     /// `dst = address of stack slot` — mirrors `VInst::SlotAddr`.
     SlotAddr { dst: PReg, slot: u32 },
     /// 32-bit constant load — mirrors `VInst::IConst32`.
     IConst32 { dst: PReg, val: i32 },
     /// Function call — mirrors `VInst::Call` (post-regalloc: `args`/`ret` are
-    /// physical registers instead of `VRegSlice`s; the sret plumbing fields do
-    /// not apply to the single-scalar mini ABI).
+    /// physical registers instead of `VRegSlice`s). Register args only
+    /// (`args.len() <= max_reg_args`, the M5 contract the P1 arg-capacity
+    /// study pins); calls needing stack-passed args or two return words use
+    /// [`MiniVInst::CallMulti`].
     Call {
         callee: Callee,
         args: Vec<PReg>,
         ret: Option<PReg>,
     },
+    /// The full mirror of the real `VInst::Call { args, rets: VRegSlice }`:
+    ///
+    /// - **Stack-passed args**: args beyond the increment's register capacity
+    ///   (6 under CALL8) are stored to the outgoing-arg area at
+    ///   `[SP + 4*(i - 6), …)` (the frame bottom), where the callee reads
+    ///   them at `[callee_SP + callee_frame + 4*(i - 6)]` — see
+    ///   [`MiniVInst::IncomingStackArg`]. This is the esp-toolchain layout
+    ///   (oracle: `call_conv.elf` `many`) and rv32's
+    ///   `[SP, SP + caller_arg_stack_size)` region.
+    /// - **Multi-return**: up to [`crate::abi::SRET_SCALAR_THRESHOLD`] (= 2)
+    ///   direct return words, read from caller `a10, a11` under CALL8
+    ///   ([`crate::gpr::CALL_RET_REGS`]).
+    /// - **sret** needs no dedicated field at the mini level: the caller
+    ///   passes a buffer address (`SlotAddr`) as the **first** argument
+    ///   (callee `a2`), matching the oracle (`call_conv.elf` `make_quad`)
+    ///   and rv32's `lpir_call_arg_target_hw` sret slot.
+    CallMulti {
+        callee: Callee,
+        args: Vec<PReg>,
+        rets: Vec<PReg>,
+    },
     /// Return — mirrors `VInst::Ret` (single optional scalar instead of
     /// `VRegSlice`).
     Ret { val: Option<PReg> },
+    /// Multi-value return: writes `vals[i]` to [`crate::gpr::RET_REGS`]`[i]`
+    /// (callee `a2, a3`) then `retw`. `vals.len() <=`
+    /// [`crate::abi::SRET_SCALAR_THRESHOLD`]; wider returns must go through
+    /// the sret buffer convention instead. Mirrors the real
+    /// `VInst::Ret { vals: VRegSlice }`.
+    RetMulti { vals: Vec<PReg> },
+    /// Load the `index`-th call argument of the *current* function when that
+    /// argument was stack-passed (`index >= max_reg_args`, 0-based over all
+    /// args): `dst = [SP + frame_size + 4*(index - max_reg_args)]` — the
+    /// incoming stack args sit in the **caller's** outgoing-arg area, which
+    /// under the windowed ABI is addressable from the callee as
+    /// `SP + frame_size` (callee SP + ENTRY frame == caller SP). Mirrors the
+    /// real backend's `Edit::LoadIncomingArg { fp_offset, to }` (there an
+    /// FP-relative regalloc edit; here FP == SP + frame).
+    IncomingStackArg { dst: PReg, index: u32 },
     /// Branch-target definition — mirrors `VInst::Label`.
     Label(LabelId),
     /// Fuel check — mirrors `VInst::FuelCheck`. `fuel_base` points at a

@@ -48,7 +48,26 @@
 //!   16 bytes per additional window unit for the `a4..` spills written by
 //!   `_WindowOverflow{8,12}` — the top [`CallInc::save_area_bytes`] of the
 //!   frame (= [`crate::abi::FRAME_TOP_RESERVED_BYTES`] under the default
-//!   policy) are reserved and stack slots grow from `a1 + 0` upward.
+//!   policy) are reserved. Below that, the frame builds upward from `a1 + 0`:
+//!   first the **outgoing stack-arg area** (`4 * max_stack_args` bytes, when
+//!   any call in the function passes more than [`CallInc::max_reg_args`]
+//!   register arguments), then the stack slots. This is the layout the esp
+//!   toolchain uses (oracle: `fixtures/elf/call_conv.elf` — the caller stores
+//!   args 7+ at its own `SP+0, SP+4, …`; the callee reads them at
+//!   `SP + frame + 0, +4, …`, since callee `SP + ENTRY frame == caller SP`)
+//!   and the same region order as rv32's `abi/frame.rs::compute()`
+//!   (`caller_arg_stack_size` at `[SP, SP+size)`, everything else above).
+//!   The callee's own reserved top (`[caller_SP - 32, caller_SP)`) sits
+//!   directly *below* the caller's outgoing-arg area — adjacent, disjoint.
+//! - Every immediate field is gated through the per-opcode legality table
+//!   [`crate::imm`] before encoding — [`fn@lp_xt_inst::encode`] masks fields
+//!   and silently truncates, so an ungated immediate is a wrong-code bug.
+//! - Frames larger than `ENTRY`'s immediate (frame > 32760 after rounding,
+//!   i.e. slot bytes > 32720 under the default 32-byte reservation) are a
+//!   **documented hard error** (panic at emit time), not the `MOVSP` idiom —
+//!   pinned by the P2 ADR (`FP_REG` rationale): LPIR has no alloca and no
+//!   frame that large; `MOVSP`'s save-area-relocation semantics would buy
+//!   complexity for no reachable case.
 
 extern crate alloc;
 
@@ -61,6 +80,7 @@ use lp_xt_inst::{
 };
 
 use crate::gpr;
+use crate::imm::{self, ImmOp};
 use crate::vinst::{
     AluImmOp, AluOp, Callee, IcmpCond, LabelId, MiniFunc, MiniProgram, MiniVInst, PReg, SymbolId,
 };
@@ -179,12 +199,11 @@ impl CallInc {
     }
 }
 
-/// `beqz`/`bnez` (BRI12) taken-target range: `PC + 4 + imm12`, imm12 signed.
+/// `beqz`/`bnez` (BRI12) taken-target range: `PC + 4 + imm12`, imm12 signed
+/// (= the legality table's `Branch12Disp`; kept as `i64` bounds for the
+/// relaxation loop's offset arithmetic).
 const BRI12_MIN: i64 = -2048;
 const BRI12_MAX: i64 = 2047;
-/// `J` (CALL-format, 18-bit signed byte offset).
-const J_MIN: i64 = -(1 << 17);
-const J_MAX: i64 = (1 << 17) - 1;
 
 /// Result of emitting a [`MiniProgram`].
 #[derive(Clone, Debug)]
@@ -291,6 +310,16 @@ struct Emitter {
     inc: CallInc,
 }
 
+/// Per-function frame facts the instruction lowerings need.
+struct FrameCtx {
+    /// Byte offset of each declared slot from `SP + 0` (already shifted above
+    /// the outgoing stack-arg area).
+    slot_offsets: Vec<u32>,
+    /// The `ENTRY` frame size — `SP + frame` is the caller's SP, where the
+    /// incoming stack args (if any) begin.
+    frame: u32,
+}
+
 impl Emitter {
     // --- item/byte helpers -------------------------------------------------
 
@@ -332,8 +361,10 @@ impl Emitter {
     }
 
     /// Materialize a 32-bit constant into `rd` (`movi` or pooled `l32r`).
+    /// The `movi` range comes from the legality table ([`ImmOp::Movi`],
+    /// fallback [`imm::Fallback::LiteralPool`]).
     fn iconst(&mut self, rd: Reg, val: i32) {
-        if (-2048..=2047).contains(&val) {
+        if imm::is_legal(ImmOp::Movi, val) {
             self.inst(Inst::Movi(rd, val));
         } else {
             let lit = self.lit(Literal::Const(val as u32));
@@ -341,23 +372,26 @@ impl Emitter {
         }
     }
 
-    /// `rd = rs + imm`, using `addi`/`addmi` when they fit.
+    /// `rd = rs + imm`, using `addi`/`addmi` when they fit (the table's
+    /// [`ImmOp::Addi`] fallback chain: `AddmiSplit`, then `ConstThenReg`).
     fn add_imm(&mut self, rd: Reg, rs: Reg, imm: i32) {
         if imm == 0 {
             self.mov(rd, rs);
-        } else if (-128..=127).contains(&imm) {
+        } else if imm::is_legal(ImmOp::Addi, imm) {
             self.inst(Inst::Addi(rd, rs, imm));
-        } else if (-32768..=32512).contains(&imm) && imm % 256 == 0 {
+        } else if imm::is_legal(ImmOp::Addmi, imm) {
             self.inst(Inst::Addmi(rd, rs, imm));
-        } else if (-32768..=32639).contains(&imm) {
-            // addmi (high byte) + addi (low byte, signed).
-            let low = (imm << 24) >> 24; // sign-extended low 8 bits
-            let high = imm - low; // multiple of 256
-            self.inst(Inst::Addmi(rd, rs, high));
-            self.inst(Inst::Addi(rd, rd, low));
         } else {
-            self.iconst(SCRATCH1, imm);
-            self.inst(Inst::Rrr(AluRrr::Add, rd, rs, SCRATCH1));
+            // addmi (high byte) + addi (low byte, signed), when both parts fit.
+            let low = (imm << 24) >> 24; // sign-extended low 8 bits
+            let high = imm.wrapping_sub(low); // multiple of 256
+            if imm::is_legal(ImmOp::Addmi, high) {
+                self.inst(Inst::Addmi(rd, rs, high));
+                self.inst(Inst::Addi(rd, rd, low));
+            } else {
+                self.iconst(SCRATCH1, imm);
+                self.inst(Inst::Rrr(AluRrr::Add, rd, rs, SCRATCH1));
+            }
         }
     }
 
@@ -382,31 +416,65 @@ impl Emitter {
         self.n_funcs = n_funcs;
         self.push(Item::FuncStart(idx));
 
-        // Frame: reserved save areas at the top, slots from a1+0 upward.
+        // Frame, from a1+0 upward: [outgoing stack args][slots][reserved save
+        // areas at the top]. The outgoing-arg area is sized for the call in
+        // this function with the most stack-passed arguments (0 when every
+        // call fits in registers) — the layout the esp toolchain uses and
+        // rv32's `caller_arg_stack_size` analogue.
+        let max_reg_args = self.inc.max_reg_args();
+        let out_arg_bytes = f
+            .insts
+            .iter()
+            .map(|i| match i {
+                MiniVInst::Call { args, .. } | MiniVInst::CallMulti { args, .. } => {
+                    4 * args.len().saturating_sub(max_reg_args) as u32
+                }
+                _ => 0,
+            })
+            .max()
+            .unwrap_or(0);
         let slot_offsets: Vec<u32> = {
             let mut offs = Vec::with_capacity(f.slots.len());
-            let mut at = 0u32;
+            let mut at = out_arg_bytes;
             for &sz in &f.slots {
                 offs.push(at);
                 at += sz.div_ceil(4) * 4;
             }
             offs
         };
-        let slots_bytes = slot_offsets
+        let slots_end = slot_offsets
             .last()
             .zip(f.slots.last())
-            .map_or(0, |(&o, &s)| o + s.div_ceil(4) * 4);
+            .map_or(out_arg_bytes, |(&o, &s)| o + s.div_ceil(4) * 4);
         let align = crate::abi::STACK_ALIGNMENT;
-        let frame = (self.inc.save_area_bytes() + slots_bytes).div_ceil(align) * align;
-        assert!(frame <= 32760, "frame too large for ENTRY immediate");
+        let frame = (self.inc.save_area_bytes() + slots_end).div_ceil(align) * align;
+        // Large-frame limit: ENTRY's frame field is unsigned, scaled by 8,
+        // 0..=32760 (imm12 << 3). Frames beyond it are a DOCUMENTED HARD
+        // ERROR, not the MOVSP idiom — see the module docs and the P2 ADR.
+        // `lp_xt_inst::encode` would silently truncate (entry 32768 -> 0), so
+        // this gate is load-bearing.
+        assert!(
+            imm::is_legal(ImmOp::EntryFrame, frame as i32),
+            "frame of {frame} bytes exceeds ENTRY's immediate limit of 32760 \
+             (slots + outgoing args must total <= {} under the {}-byte save-area \
+             reservation); frames this large are unsupported by policy (no MOVSP \
+             idiom -- see the P2 ABI ADR)",
+            32752 - self.inc.save_area_bytes(),
+            self.inc.save_area_bytes(),
+        );
         self.inst(Inst::Entry(SP, frame));
 
+        let ctx = FrameCtx {
+            slot_offsets,
+            frame,
+        };
         for inst in &f.insts {
-            self.lower_inst(idx, inst, &slot_offsets);
+            self.lower_inst(idx, inst, &ctx);
         }
     }
 
-    fn lower_inst(&mut self, fidx: usize, mi: &MiniVInst, slot_offsets: &[u32]) {
+    fn lower_inst(&mut self, fidx: usize, mi: &MiniVInst, ctx: &FrameCtx) {
+        let slot_offsets = &ctx.slot_offsets[..];
         match mi {
             MiniVInst::AluRRR {
                 op,
@@ -478,23 +546,66 @@ impl Emitter {
             }
             MiniVInst::Load32 { dst, base, offset } => {
                 let (d, b) = (self.r(*dst), self.r(*base));
-                let (b, off) = self.mem_addr(b, *offset, 1020, 4);
+                let (b, off) = self.mem_addr(b, *offset, ImmOp::L32i);
                 self.inst(Inst::Load(LoadOp::L32i, d, b, off));
+            }
+            MiniVInst::Load8U { dst, base, offset } => {
+                let (d, b) = (self.r(*dst), self.r(*base));
+                let (b, off) = self.mem_addr(b, *offset, ImmOp::L8ui);
+                self.inst(Inst::Load(LoadOp::L8ui, d, b, off));
+            }
+            MiniVInst::Load8S { dst, base, offset } => {
+                // No l8si on Xtensa: zero-extending load + sign-extend from
+                // bit 7 (`sext` bit position is legal per the table, 7..=22).
+                let (d, b) = (self.r(*dst), self.r(*base));
+                let (b, off) = self.mem_addr(b, *offset, ImmOp::L8ui);
+                self.inst(Inst::Load(LoadOp::L8ui, d, b, off));
+                debug_assert!(imm::is_legal(ImmOp::SextBit, 7));
+                self.inst(Inst::Sext(d, d, 7));
+            }
+            MiniVInst::Load16U { dst, base, offset } => {
+                let (d, b) = (self.r(*dst), self.r(*base));
+                let (b, off) = self.mem_addr(b, *offset, ImmOp::L16ui);
+                self.inst(Inst::Load(LoadOp::L16ui, d, b, off));
+            }
+            MiniVInst::Load16S { dst, base, offset } => {
+                let (d, b) = (self.r(*dst), self.r(*base));
+                let (b, off) = self.mem_addr(b, *offset, ImmOp::L16si);
+                self.inst(Inst::Load(LoadOp::L16si, d, b, off));
             }
             MiniVInst::Store32 { src, base, offset } => {
                 let (s, b) = (self.r(*src), self.r(*base));
-                let (b, off) = self.mem_addr(b, *offset, 1020, 4);
+                let (b, off) = self.mem_addr(b, *offset, ImmOp::S32i);
                 self.inst(Inst::Store(StoreOp::S32i, s, b, off));
             }
             MiniVInst::Store8 { src, base, offset } => {
                 let (s, b) = (self.r(*src), self.r(*base));
-                let (b, off) = self.mem_addr(b, *offset, 255, 1);
+                let (b, off) = self.mem_addr(b, *offset, ImmOp::S8i);
                 self.inst(Inst::Store(StoreOp::S8i, s, b, off));
             }
             MiniVInst::Store16 { src, base, offset } => {
                 let (s, b) = (self.r(*src), self.r(*base));
-                let (b, off) = self.mem_addr(b, *offset, 510, 2);
+                let (b, off) = self.mem_addr(b, *offset, ImmOp::S16i);
                 self.inst(Inst::Store(StoreOp::S16i, s, b, off));
+            }
+            MiniVInst::Neg { dst, src } => {
+                let (d, s) = (self.r(*dst), self.r(*src));
+                self.inst(Inst::Rt(AluRt::Neg, d, s));
+            }
+            MiniVInst::Bnot { dst, src } => {
+                // No `not` (and no xor-immediate — ImmRule::NoImmForm):
+                // materialize -1 and xor.
+                let (d, s) = (self.r(*dst), self.r(*src));
+                self.iconst(SCRATCH1, -1);
+                self.inst(Inst::Rrr(AluRrr::Xor, d, s, SCRATCH1));
+            }
+            MiniVInst::MemcpyWords {
+                dst_base,
+                src_base,
+                size,
+            } => {
+                let (d, s) = (self.r(*dst_base), self.r(*src_base));
+                self.memcpy_words(d, s, *size);
             }
             MiniVInst::SlotAddr { dst, slot } => {
                 let d = self.r(*dst);
@@ -508,61 +619,60 @@ impl Emitter {
                 self.iconst(d, *val);
             }
             MiniVInst::Call { callee, args, ret } => {
+                // The legacy single-ret Call keeps the M5 register-only
+                // contract (pinned by the P1 study's arg-capacity probes);
+                // stack-passed args go through CallMulti, the full mirror of
+                // the real `VInst::Call`.
                 let inc = self.inc;
                 assert!(
                     args.len() <= inc.max_reg_args(),
-                    "at most {} register args under {inc:?} (got {})",
+                    "at most {} register args under {inc:?} (got {}); use \
+                     CallMulti for stack-passed arguments",
                     inc.max_reg_args(),
                     args.len()
                 );
-                // Stage args at the increment's staging area (under the
-                // default CALL8 policy: gpr::OUT_ARG_REGS). Under CALL8/12
-                // the staging registers (a10+/a14+) never alias the a2..=a7
-                // sources; under CALL4 the area is a6..a11, so dests inside
-                // the program bank (a6/a7) would clobber still-unread
-                // sources — bounce those through the registers just above
-                // the 6-slot staging area (a12/a13 for CALL4: free — above
-                // staging, below nothing live) and write them last.
-                let base = inc.arg_base();
-                let mut bounced: [Option<(u8, u8)>; 2] = [None; 2];
-                for (i, a) in args.iter().enumerate() {
-                    let s = self.r(*a);
-                    let dest = base + i as u8;
-                    if gpr::is_callee_saved_pool(dest) {
-                        let tmp = base + gpr::ARG_REGS.len() as u8 + i as u8;
-                        self.mov(Reg::new(tmp), s);
-                        bounced[i] = Some((dest, tmp));
-                    } else {
-                        self.mov(Reg::new(dest), s);
-                    }
-                }
-                for (dest, tmp) in bounced.into_iter().flatten() {
-                    self.mov(Reg::new(dest), Reg::new(tmp));
-                }
-                match callee {
-                    Callee::Func(f) => {
-                        assert!(*f < self.n_funcs, "Call to unknown function {f}");
-                        self.push(Item::CallFunc { func: *f });
-                    }
-                    Callee::Sym(sym) => {
-                        let lit = self.lit(Literal::Sym(*sym));
-                        self.push(Item::L32r { rt: SCRATCH0, lit });
-                        self.inst(Inst::Callx(inc.callx_op(), SCRATCH0));
-                    }
-                }
-                if let Some(rr) = ret {
-                    // The callee's RET_REGS[0] rotates back to caller
-                    // `arg_base` (= gpr::CALL_RET_REGS[0] under CALL8).
-                    let d = self.r(*rr);
-                    self.mov(d, Reg::new(base));
-                }
+                let rets: &[PReg] = ret.as_ref().map(core::slice::from_ref).unwrap_or(&[]);
+                self.lower_call(callee, args, rets);
+            }
+            MiniVInst::CallMulti { callee, args, rets } => {
+                assert!(
+                    rets.len() <= crate::abi::SRET_SCALAR_THRESHOLD,
+                    "at most {} direct return words (got {}); wider returns \
+                     use the sret buffer convention",
+                    crate::abi::SRET_SCALAR_THRESHOLD,
+                    rets.len()
+                );
+                self.lower_call(callee, args, rets);
             }
             MiniVInst::Ret { val } => {
-                if let Some(v) = val {
-                    let s = self.r(*v);
-                    self.mov(Reg::new(gpr::RET_REGS[0]), s);
-                }
-                self.inst(Inst::Nullary(NullaryOp::Retw));
+                let vals: &[PReg] = val.as_ref().map(core::slice::from_ref).unwrap_or(&[]);
+                self.lower_ret(vals);
+            }
+            MiniVInst::RetMulti { vals } => {
+                assert!(
+                    vals.len() <= crate::abi::SRET_SCALAR_THRESHOLD,
+                    "at most {} direct return words (got {}); wider returns \
+                     use the sret buffer convention",
+                    crate::abi::SRET_SCALAR_THRESHOLD,
+                    vals.len()
+                );
+                self.lower_ret(vals);
+            }
+            MiniVInst::IncomingStackArg { dst, index } => {
+                // Incoming stack args live in the caller's outgoing-arg area
+                // at [caller_SP + 4*(index - max_reg_args), ...), and callee
+                // SP + ENTRY frame == caller SP (oracle: call_conv.elf `many`
+                // reads args 7/8 at `l32i a1, frame+0 / frame+4`).
+                let max_reg_args = self.inc.max_reg_args() as u32;
+                assert!(
+                    *index >= max_reg_args,
+                    "IncomingStackArg index {index} names a register arg \
+                     (args 0..{max_reg_args} arrive in ARG_REGS)"
+                );
+                let d = self.r(*dst);
+                let off = ctx.frame + 4 * (index - max_reg_args);
+                let (b, off) = self.mem_addr(SP, off as i32, ImmOp::L32i);
+                self.inst(Inst::Load(LoadOp::L32i, d, b, off));
             }
             MiniVInst::Label(l) => self.push(Item::LabelDef((fidx, *l))),
             MiniVInst::FuelCheck {
@@ -585,10 +695,174 @@ impl Emitter {
         }
     }
 
+    /// Shared call lowering for [`MiniVInst::Call`] / [`MiniVInst::CallMulti`].
+    ///
+    /// Register args 0..max_reg_args stage at the increment's staging area
+    /// (caller `a10..=a15` under CALL8 = [`gpr::OUT_ARG_REGS`]); args beyond
+    /// go to the outgoing stack-arg area at `[SP + 4*(i - max_reg_args), …)`
+    /// — the frame bottom, which the callee addresses as `SP + its_frame + …`
+    /// (esp-toolchain oracle: `call_conv.elf`). Return words come back in
+    /// caller `arg_base + i` ([`gpr::CALL_RET_REGS`] under CALL8).
+    fn lower_call(&mut self, callee: &Callee, args: &[PReg], rets: &[PReg]) {
+        let inc = self.inc;
+        let max_reg = inc.max_reg_args();
+        // Stack args first (stores read the preserved-bank sources and touch
+        // no staging register), then register staging.
+        for (i, a) in args.iter().enumerate().skip(max_reg) {
+            let s = self.r(*a);
+            let off = 4 * (i - max_reg) as i32;
+            let (b, off) = self.mem_addr(SP, off, ImmOp::S32i);
+            self.inst(Inst::Store(StoreOp::S32i, s, b, off));
+        }
+        // Stage register args at the increment's staging area (under the
+        // default CALL8 policy: gpr::OUT_ARG_REGS). Under CALL8/12 the
+        // staging registers (a10+/a14+) never alias the a2..=a7 sources;
+        // under CALL4 the area is a6..a11, so dests inside the program bank
+        // (a6/a7) would clobber still-unread sources — bounce those through
+        // the registers just above the 6-slot staging area (a12/a13 for
+        // CALL4: free — above staging, below nothing live) and write them
+        // last.
+        let base = inc.arg_base();
+        let mut bounced: [Option<(u8, u8)>; 2] = [None; 2];
+        for (i, a) in args.iter().enumerate().take(max_reg) {
+            let s = self.r(*a);
+            let dest = base + i as u8;
+            if gpr::is_callee_saved_pool(dest) {
+                let tmp = base + gpr::ARG_REGS.len() as u8 + i as u8;
+                self.mov(Reg::new(tmp), s);
+                bounced[i] = Some((dest, tmp));
+            } else {
+                self.mov(Reg::new(dest), s);
+            }
+        }
+        for (dest, tmp) in bounced.into_iter().flatten() {
+            self.mov(Reg::new(dest), Reg::new(tmp));
+        }
+        match callee {
+            Callee::Func(f) => {
+                assert!(*f < self.n_funcs, "Call to unknown function {f}");
+                self.push(Item::CallFunc { func: *f });
+            }
+            Callee::Sym(sym) => {
+                let lit = self.lit(Literal::Sym(*sym));
+                self.push(Item::L32r { rt: SCRATCH0, lit });
+                self.inst(Inst::Callx(inc.callx_op(), SCRATCH0));
+            }
+        }
+        // The callee's RET_REGS rotate back to caller `arg_base + i`
+        // (= gpr::CALL_RET_REGS under CALL8). Under CALL4 the result bank
+        // (a6, a7) overlaps the program bank, so reading ret 0 into a
+        // program register could clobber ret 1's source before it is read —
+        // read in a clobber-free order, bouncing through scratch when both
+        // orders conflict.
+        assert!(rets.len() <= 2, "at most 2 direct return words");
+        match rets {
+            [] => {}
+            [r0] => {
+                let d = self.r(*r0);
+                self.mov(d, Reg::new(base));
+            }
+            [r0, r1] => {
+                let (d0, d1) = (self.r(*r0), self.r(*r1));
+                let (s0, s1) = (Reg::new(base), Reg::new(base + 1));
+                if d0 != s1 {
+                    self.mov(d0, s0);
+                    self.mov(d1, s1);
+                } else if d1 != s0 {
+                    self.mov(d1, s1);
+                    self.mov(d0, s0);
+                } else {
+                    // Full swap: bounce ret 0 through scratch.
+                    self.mov(SCRATCH0, s0);
+                    self.mov(d1, s1);
+                    self.mov(d0, SCRATCH0);
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Shared return lowering for [`MiniVInst::Ret`] / [`MiniVInst::RetMulti`]:
+    /// write `vals[i]` to [`gpr::RET_REGS`]`[i]` (callee `a2, a3`), then
+    /// `retw`. The destinations overlap the program bank, so the two-word
+    /// case needs the same clobber-free ordering as the call-result reads.
+    fn lower_ret(&mut self, vals: &[PReg]) {
+        assert!(vals.len() <= gpr::RET_REGS.len(), "too many return words");
+        match vals {
+            [] => {}
+            [v] => {
+                let s = self.r(*v);
+                self.mov(Reg::new(gpr::RET_REGS[0]), s);
+            }
+            [v0, v1] => {
+                let (s0, s1) = (self.r(*v0), self.r(*v1));
+                let (d0, d1) = (Reg::new(gpr::RET_REGS[0]), Reg::new(gpr::RET_REGS[1]));
+                if d0 != s1 {
+                    self.mov(d0, s0);
+                    self.mov(d1, s1);
+                } else if d1 != s0 {
+                    self.mov(d1, s1);
+                    self.mov(d0, s0);
+                } else {
+                    // vals == [a3, a2]: full swap through scratch.
+                    self.mov(SCRATCH0, s0);
+                    self.mov(d1, s1);
+                    self.mov(d0, SCRATCH0);
+                }
+            }
+            _ => unreachable!(),
+        }
+        self.inst(Inst::Nullary(NullaryOp::Retw));
+    }
+
+    /// Word-granular memcpy: unrolled `l32i`/`s32i` pairs through
+    /// [`SCRATCH0`]. Copies past the 1020-byte offset ceiling bump both base
+    /// registers by whole chunks and restore them exactly at the end (the
+    /// mini emitter has only two scratch registers — rv32 uses three TEMPs
+    /// and rolling pointers; the bump-and-restore keeps the program-visible
+    /// contract identical: bases unchanged after the copy).
+    fn memcpy_words(&mut self, dst: Reg, src: Reg, size: u32) {
+        assert!(
+            size.is_multiple_of(4),
+            "MemcpyWords size {size} not a multiple of 4"
+        );
+        if dst == src {
+            // Self-copy is the identity; emitting it anyway would double-bump
+            // the shared base register between chunks.
+            return;
+        }
+        // Largest offset-addressable chunk: offsets 0..=1020 step 4.
+        const CHUNK: u32 = 1024;
+        let mut copied = 0u32;
+        let mut bumped = 0i32;
+        while copied < size {
+            let chunk = (size - copied).min(CHUNK);
+            let mut off = 0;
+            while off < chunk {
+                debug_assert!(imm::is_legal(ImmOp::L32i, off as i32));
+                self.inst(Inst::Load(LoadOp::L32i, SCRATCH0, src, off));
+                self.inst(Inst::Store(StoreOp::S32i, SCRATCH0, dst, off));
+                off += 4;
+            }
+            copied += chunk;
+            if copied < size {
+                self.add_imm(src, src, chunk as i32);
+                self.add_imm(dst, dst, chunk as i32);
+                bumped += chunk as i32;
+            }
+        }
+        if bumped != 0 {
+            self.add_imm(src, src, -bumped);
+            self.add_imm(dst, dst, -bumped);
+        }
+    }
+
     /// Reduce a load/store address to an encodable (base, offset) pair, going
-    /// through scratch when the offset is negative or out of range.
-    fn mem_addr(&mut self, base: Reg, offset: i32, max: i32, align: i32) -> (Reg, u32) {
-        if (0..=max).contains(&offset) && offset % align == 0 {
+    /// through scratch when the offset is illegal for `op` per the legality
+    /// table (negative, out of range, or misaligned — the table's
+    /// [`imm::Fallback::AddressScratch`]).
+    fn mem_addr(&mut self, base: Reg, offset: i32, op: ImmOp) -> (Reg, u32) {
+        if imm::is_legal(op, offset) {
             (base, offset as u32)
         } else {
             self.add_imm(SCRATCH0, base, offset);
@@ -811,24 +1085,38 @@ impl Emitter {
                 }
                 Item::L32r { rt, lit } => {
                     let lit_off = 4 * *lit as i64;
-                    // target = ((PC + 3) & !3) + (imm16 << 2); pool-at-start
-                    // makes every offset backward (imm16 < 0). Valid for any
-                    // 4-aligned load address.
+                    // target = ((PC + 3) & !3) + (one_extend(imm16) << 2);
+                    // pool-at-start makes every offset backward. The 16-bit
+                    // field is ONE-extended (value = field - 0x10000), so the
+                    // full legal displacement is -262144..=-4 bytes — encoded
+                    // field values 0x0000..0x7FFF reach the *farther* 128 KiB
+                    // (imm.rs L32rDisp; gas-probed at both boundaries). The
+                    // old assert here used the sign-extended-i16 half range,
+                    // -131072..=-4 — the bug the imm-table work found.
                     let base = (pc + 3) & !3;
-                    let imm = (lit_off - base) >> 2;
+                    let disp = lit_off - base;
                     assert!(
-                        (-32768..0).contains(&imm),
-                        "L32R offset out of backward range (imm16 = {imm})"
+                        imm::is_legal(ImmOp::L32rDisp, disp as i32),
+                        "L32R displacement {disp} outside the backward range \
+                         -262144..=-4 (pool-before-code guarantees reach only \
+                         within the first ~256 KiB of code)"
                     );
-                    code.extend_from_slice(&encode(&Inst::L32r(*rt, imm as i16 as u16)));
+                    let field = ((disp >> 2) & 0xFFFF) as u16;
+                    code.extend_from_slice(&encode(&Inst::L32r(*rt, field)));
                 }
                 Item::CallFunc { func } => {
                     let target = labels.funcs[*func] as i64;
                     // target = (PC & !3) + (off << 2) + 4; both target and the
                     // rounded PC are 4-aligned, so the division is exact.
-                    let off = (target - (pc & !3) - 4) >> 2;
-                    assert!((J_MIN..=J_MAX).contains(&off), "CALLn offset out of range");
-                    code.extend_from_slice(&encode(&Inst::Call(self.inc.call_op(), off as i32)));
+                    let disp = target - (pc & !3) - 4;
+                    assert!(
+                        imm::is_legal(ImmOp::CallDisp, disp as i32),
+                        "CALLn displacement {disp} out of range"
+                    );
+                    code.extend_from_slice(&encode(&Inst::Call(
+                        self.inc.call_op(),
+                        (disp >> 2) as i32,
+                    )));
                 }
             }
         }
@@ -864,7 +1152,10 @@ impl Emitter {
 /// `J` offset for a jump at `pc` targeting `target` (target = PC + 4 + off).
 fn j_off(pc: i64, target: i64) -> i32 {
     let off = target - (pc + 4);
-    assert!((J_MIN..=J_MAX).contains(&off), "J offset out of range");
+    assert!(
+        imm::is_legal(ImmOp::JDisp, off as i32),
+        "J offset out of range"
+    );
     off as i32
 }
 

@@ -63,10 +63,17 @@ impl Emulator {
                 });
             }
             Inst::L32r(rt, field) => {
-                // Target = ((PC + 3) & !3) + (imm16 << 2), backward-only. The
-                // stored field is the raw 16-bit encoding (negative offset).
+                // Target = ((PC + 3) & !3) + ((imm16 - 0x1_0000) << 2).
+                //
+                // The 16-bit field is ONE-EXTENDED, not sign-extended: it always
+                // denotes a negative word offset in -65536..=-1, so the whole
+                // -262144..=-4 byte range is reachable. Sign-extending instead
+                // (`field as i16`) mis-executes every field >= 0x8000's
+                // counterpart — fields 0x0000..0x7fff would become *forward*
+                // offsets. Matches `lp_xt_inst::disasm::l32r_target` (which is
+                // verified against objdump) and `xt_mini_emit::imm::L32rDisp`.
                 let base = pc.wrapping_add(3) & !3;
-                let off = ((field as i16 as i32) << 2) as u32;
+                let off = (((field as i32) - 0x1_0000) << 2) as u32;
                 let addr = base.wrapping_add(off);
                 let v = self.mem.read_u32(addr)?;
                 self.wreg(rt.num(), v, tracer);
