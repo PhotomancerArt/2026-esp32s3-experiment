@@ -1,3 +1,11 @@
+# Own workspace root: fw/ is excluded from the repo-root workspace and this
+# crate carries its own Cargo.lock. Without this, a git worktree checked out
+# under <repo>/.claude/worktrees/<name>/ makes Cargo walk past the worktree
+# root manifest (which excludes fw/) into the OUTER checkout's Cargo.toml,
+# which neither includes nor excludes this path — "current package believes
+# it's in a workspace when it's not".
+[workspace]
+
 [package]
 edition      = "2021"
 # Crate named without the year prefix: rustc crate names must be valid
