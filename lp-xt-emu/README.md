@@ -1,9 +1,9 @@
 # lp-xt-emu
 
-A pure-Rust Xtensa (ESP32-S3 / LX7) instruction-set **emulator core** with the
-windowed-register machinery. Part of the standalone Xtensa-backend work
-(milestone M3); mirrors `lp2025`'s `lp-riscv-emu` architecture so the eventual
-monorepo backport is a merge, not a rewrite.
+A pure-Rust Xtensa (ESP32-S3 / LX7 and classic ESP32 / LX6) instruction-set
+**emulator core** with the windowed-register machinery. Part of the standalone
+Xtensa-backend work (milestone M3); mirrors `lp2025`'s `lp-riscv-emu`
+architecture so the eventual monorepo backport is a merge, not a rewrite.
 
 Scope is *core*: executors + memory + the window machinery. FPU, cycle model,
 peripherals, and full `InstLog` parity are out of scope (the trace layer is a
@@ -15,7 +15,8 @@ hook now, built out during backport against the real filetest consumers).
 src/
   cpu.rs         CPU state: PC, 64 physical ARs, WindowBase, WindowStart, SAR,
                  PS.CALLINC, and the live call-stack shadow.
-  memory.rs      Vec-backed regions + the SRAM1 D-bus/I-bus dual mapping.
+  memory.rs      Vec-backed regions + per-region D-bus/I-bus AliasRule.
+  board.rs       BoardProfile: per-board memory maps (esp32s3 / esp32).
   trace.rs       `trait Tracer` (no-op default) + a basic text tracer.
   error.rs       Trap { Exception | Timeout }, mirroring CrashReport.
   emu.rs         Emulator: fetch/decode/execute loop + the windowed-ABI run API.
@@ -62,16 +63,50 @@ call8/call12 frames are placed just below; their exact byte placement is not
 observable for bare payloads (which never read another frame's save area), the
 deliberate "model the effect, not the handler vectors" boundary.
 
-### SRAM1 D-bus / I-bus dual mapping
+### Board profiles — the memory map is a parameter
 
-ESP32-S3 SRAM1 is dual-mapped: a byte written at a D-bus address
-(`0x3FC8_8000..0x3FCF_0000`) is fetchable at the I-bus alias `+0x6F_0000`. The
-`xt-runner` firmware writes payloads via D-bus and *executes them at the I-bus
-alias*, so self-addressing code (`l32r` literals, `call8` targets) only behaves
-identically if the emulator models the same alias. `memory.rs` backs the dual
-mapping with one store reachable at both address ranges; fetch is permitted only
-at the executable (I-bus) view, so jumping to a D-bus address faults exactly as
-hardware does (FINDINGS E2D).
+Instruction semantics are board-independent (FINDINGS: LX6 vs LX7 divergence is
+entirely in the memory system, not the core). What differs per board is where
+code and stack live and how the D-bus (data) view of code memory maps to the
+I-bus (executable) view. `board.rs` captures that as a `BoardProfile`:
+
+- `Emulator::new()` — the **ESP32-S3** profile, unchanged default: code
+  `0x3FC8_8000+128K` and stack `0x3FCC_0000+128K`, both in the SRAM1
+  dual-mapped window `0x3FC8_8000..0x3FCF_0000` with the executable alias a
+  constant offset `+0x6F_0000` (FINDINGS E2).
+- `Emulator::with_profile(BoardProfile::esp32())` — the **classic ESP32**
+  profile, from the C1–C5 hardware ladder (FINDINGS classic section):
+  - SRAM1's dual mapping (D-bus `0x3FFE_0000..0x4000_0000` ↔ I-bus
+    `0x400A_0000..0x400C_0000`) is **word-mirrored**:
+    `iram = 0x400B_FFFC − (dram − 0x3FFE_0000)` at word granularity, bytes
+    within each word verbatim (C2b, 5 sentinels; the linear hypothesis matched
+    none). So the alias is an `AliasRule` — `Offset`, `Identity`, or
+    `WordMirrored` — not a constant.
+  - Code: 92 KiB at D-bus `0x3FFE_8000` inside the measured-free span
+    (dram2_seg `0x3FFE_7E30..0x3FFF_FF80`, ~96 KB usable). SRAM1 is the region
+    a runner would use; the alternatives are SRAM0 (~125 KB, identity-mapped,
+    **word-only writes**) and RTC-fast (8 KB, `+0xC4_0000`).
+  - Stack: 64 KiB at `0x3FFC_0000` in SRAM2 (dram_seg, plain data RAM — C5
+    measured 98 304 B heap free, so 64 KiB fits with headroom). SRAM2 has no
+    I-bus view, so fetching there faults (EXCCAUSE=2) exactly as the classic
+    heap does on hardware (C2g) — S3's "the heap is executable" does not carry.
+
+`Emulator::run` loads the blob at `profile.code_ibus_base()` so byte *i* of the
+code lands at I-bus address `base + i`; under the classic mirror the backing
+D-bus image walks downward word by word, exactly as the device writer lays it
+out. Not modeled: classic's *word-only* data access to I-bus addresses (byte
+stores to SRAM0/I-bus fault EXCCAUSE=3 on hardware) — the emulator is more
+permissive there; the device-side writer honors the constraint.
+
+### D-bus / I-bus dual mapping
+
+The runner firmware writes payloads via the D-bus view and *executes them at
+the I-bus view*, so self-addressing code (`l32r` literals, `call8` targets)
+only behaves identically if the emulator models the same alias. `memory.rs`
+backs each dual mapping with one store reachable at both address ranges (the
+region carries its `AliasRule`); fetch is permitted only at the executable
+(I-bus) view, so jumping to a D-bus address faults exactly as hardware does
+(FINDINGS E2D, and classic C2g).
 
 ## Run API
 
@@ -115,7 +150,11 @@ hand-recalled (repo lesson: 2/3 hand-recalls are wrong).
 are implemented from the **Xtensa ISA Reference Manual** and validated
 behaviorally against real ESP32-S3 hardware (the `xt-runner` oracle). Encoding
 data is consumed via `lp-xt-inst` (whose provenance derives from the Apache-2.0
-LLVM Xtensa tables).
+LLVM Xtensa tables). Both board memory maps are **hardware-measured, never
+recalled**: the S3 map from the original spike (FINDINGS E1–E5,
+`fw/spike-esp32s3`), the classic map from the C1–C5 ladder run 2026-07-28 on
+rev v3.0 silicon (FINDINGS classic section, `fw/spike-esp32`) — including the
+word-mirrored SRAM1 rule, established with 5 sentinel probes.
 
 **No GPL source was used.** QEMU (`espressif/qemu`) and binutils/GDB — including
 their windowed-register handling and the `_WindowOverflow`/`_WindowUnderflow`

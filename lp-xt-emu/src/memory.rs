@@ -1,11 +1,17 @@
-//! Flat, `Vec`-backed memory with the ESP32-S3 SRAM1 D-bus / I-bus dual mapping.
+//! Flat, `Vec`-backed memory with per-region D-bus / I-bus dual mapping.
 //!
-//! The hardware fact this models (see `../FINDINGS.md`, E2): a byte written at a
-//! D-bus SRAM1 address (`0x3FC8_8000..0x3FCF_0000`) is fetchable at the I-bus
-//! alias `+0x6F_0000`. The `xt-runner` firmware writes payloads via the D-bus
-//! address and *executes them at the I-bus alias*, so self-addressing code
+//! The hardware fact this models (see `../FINDINGS.md`, E2 and C2): a byte
+//! written at a D-bus (data) address may be fetchable at an I-bus
+//! (instruction) alias address. The runner firmware writes payloads via the
+//! D-bus view and *executes them at the I-bus view*, so self-addressing code
 //! (`l32r` literals, `call8` targets) only behaves identically if the emulator
 //! models the same alias — one backing store reachable at two address ranges.
+//!
+//! The *shape* of the alias is per-board (see [`AliasRule`]):
+//! - ESP32-S3 SRAM1: a constant offset, `iram = dram + 0x6F_0000` (E2).
+//! - Classic ESP32 SRAM1: **word-mirrored**, `iram = 0x400B_FFFC − (dram −
+//!   0x3FFE_0000)` — the two windows run in opposite directions at word
+//!   granularity, bytes within each word verbatim (C2b, 5 sentinels).
 //!
 //! Original code; no derivation from QEMU/binutils (see the repo license ADR).
 
@@ -15,18 +21,74 @@ use crate::error::{Trap, TrapKind};
 pub const SRAM1_DBUS_START: u32 = 0x3FC8_8000;
 /// ESP32-S3 SRAM1 D-bus window end (exclusive).
 pub const SRAM1_DBUS_END: u32 = 0x3FCF_0000;
-/// Offset from a D-bus SRAM1 address to its I-bus (instruction) alias.
+/// Offset from an ESP32-S3 D-bus SRAM1 address to its I-bus alias.
 pub const IBUS_ALIAS_OFFSET: u32 = 0x006F_0000;
+
+/// How a region's D-bus (data) addresses map to I-bus (executable) addresses.
+///
+/// Expressed as a rule, not a constant, because the classic ESP32's SRAM1
+/// mapping is not an offset (FINDINGS C2b). All variants map at *word*
+/// granularity with bytes within each 32-bit word preserved verbatim
+/// (little-endian, no swap) — hardware-verified on both boards.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AliasRule {
+    /// `iram = dram + offset`. ESP32-S3 SRAM1 (`+0x6F_0000`, FINDINGS E2) and
+    /// classic ESP32 RTC-fast (`+0xC4_0000`, FINDINGS C2a) are this shape.
+    Offset(u32),
+    /// The region's own address is directly fetchable — no separate D-bus
+    /// view. Classic ESP32 SRAM0 is this shape (FINDINGS C2c/C2x).
+    Identity,
+    /// Word-mirrored: `iram_word = iram_top − (dram_word − dram_base)`, the
+    /// two windows running in opposite directions word by word; the byte
+    /// offset within each word is preserved. Classic ESP32 SRAM1 (FINDINGS
+    /// C2b: H2 matched all 5 sentinels, H1-linear matched none).
+    ///
+    /// `dram_base`/`iram_top` are the *window* constants (classic:
+    /// `0x3FFE_0000` / `0x400B_FFFC`), not region-relative — any region
+    /// inside the window uses the same global rule.
+    WordMirrored { dram_base: u32, iram_top: u32 },
+}
+
+impl AliasRule {
+    /// The I-bus (executable) address of the byte at D-bus address `dbus`.
+    pub fn dbus_to_ibus(&self, dbus: u32) -> u32 {
+        match *self {
+            AliasRule::Offset(o) => dbus.wrapping_add(o),
+            AliasRule::Identity => dbus,
+            AliasRule::WordMirrored {
+                dram_base,
+                iram_top,
+            } => iram_top
+                .wrapping_sub((dbus & !3).wrapping_sub(dram_base))
+                .wrapping_add(dbus & 3),
+        }
+    }
+
+    /// The D-bus (data) address of the byte at I-bus address `ibus`. Exact
+    /// inverse of [`dbus_to_ibus`](Self::dbus_to_ibus) at byte granularity.
+    pub fn ibus_to_dbus(&self, ibus: u32) -> u32 {
+        match *self {
+            AliasRule::Offset(o) => ibus.wrapping_sub(o),
+            AliasRule::Identity => ibus,
+            AliasRule::WordMirrored {
+                dram_base,
+                iram_top,
+            } => dram_base
+                .wrapping_add(iram_top.wrapping_sub(ibus & !3))
+                .wrapping_add(ibus & 3),
+        }
+    }
+}
 
 /// A contiguous, `Vec`-backed memory region.
 ///
 /// A region is addressable at its D-bus range `[dbus_start, dbus_start + len)`
-/// for data access. If `alias_offset != 0` the same backing bytes are *also*
-/// addressable — for both fetch and data — at the I-bus alias range
-/// `[dbus_start + alias_offset, dbus_start + alias_offset + len)`.
+/// for data access. If `alias` is set the same backing bytes are *also*
+/// addressable — for both fetch and data — at the I-bus addresses the rule
+/// maps the D-bus range to.
 struct Region {
     dbus_start: u32,
-    alias_offset: u32,
+    alias: Option<AliasRule>,
     data: Vec<u8>,
     writable: bool,
 }
@@ -42,22 +104,19 @@ impl Region {
         }
     }
 
-    /// Byte index within `data` for `addr` if it falls in the I-bus alias range.
+    /// Byte index within `data` for `addr` if it falls in the I-bus view.
+    ///
+    /// Maps `addr` back to its D-bus counterpart via the alias rule; the
+    /// D-bus range check then gates whether it lands in this region (an
+    /// address outside the aliased image maps outside the range and misses).
     fn ibus_index(&self, addr: u32) -> Option<usize> {
-        if self.alias_offset == 0 {
-            return None;
-        }
-        let start = self.dbus_start.wrapping_add(self.alias_offset);
-        let end = start.wrapping_add(self.data.len() as u32);
-        if addr >= start && addr < end {
-            Some((addr - start) as usize)
-        } else {
-            None
-        }
+        let rule = self.alias?;
+        self.dbus_index(rule.ibus_to_dbus(addr))
     }
 }
 
-/// The emulator's physical address space: a set of regions plus the SRAM1 alias.
+/// The emulator's physical address space: a set of regions, each optionally
+/// carrying an [`AliasRule`] that makes its bytes fetchable at an I-bus view.
 pub struct Memory {
     regions: Vec<Region>,
     /// Max number of bytes accessible from any address (for load/store bounds).
@@ -89,28 +148,40 @@ impl Memory {
     pub fn add_ram(&mut self, dbus_start: u32, len: usize) {
         self.regions.push(Region {
             dbus_start,
-            alias_offset: 0,
+            alias: None,
             data: vec![0u8; len],
             writable: true,
         });
     }
 
-    /// Add a region backing the SRAM1 dual mapping: writable via the D-bus
-    /// range and fetchable/readable via the I-bus alias `+0x6F_0000`.
+    /// Add a writable region whose bytes are also fetchable at the I-bus view
+    /// given by `rule`. Window containment is the caller's business — the
+    /// board profile validates its regions against its own dual-mapped window
+    /// (see [`crate::board::BoardProfile::install`]).
+    pub fn add_executable(&mut self, dbus_start: u32, len: usize, rule: AliasRule) {
+        self.regions.push(Region {
+            dbus_start,
+            alias: Some(rule),
+            data: vec![0u8; len],
+            writable: true,
+        });
+    }
+
+    /// S3 convenience: add a region backing the ESP32-S3 SRAM1 dual mapping —
+    /// writable via the D-bus range and fetchable/readable via the I-bus alias
+    /// `+0x6F_0000`. Asserts the S3 window; other boards go through
+    /// [`add_executable`](Self::add_executable) with their own [`AliasRule`].
     pub fn add_sram1(&mut self, dbus_start: u32, len: usize) {
         assert!(
             (SRAM1_DBUS_START..SRAM1_DBUS_END).contains(&dbus_start),
-            "SRAM1 region base {dbus_start:#x} outside the dual-mapped window"
+            "SRAM1 region base {dbus_start:#x} outside the S3 dual-mapped window"
         );
-        self.regions.push(Region {
-            dbus_start,
-            alias_offset: IBUS_ALIAS_OFFSET,
-            data: vec![0u8; len],
-            writable: true,
-        });
+        self.add_executable(dbus_start, len, AliasRule::Offset(IBUS_ALIAS_OFFSET));
     }
 
-    /// The I-bus (executable) alias of a D-bus SRAM1 address.
+    /// The I-bus (executable) alias of a D-bus **ESP32-S3** SRAM1 address.
+    /// S3-specific; profile-aware code uses [`AliasRule::dbus_to_ibus`] /
+    /// [`crate::board::BoardProfile::code_ibus_base`] instead.
     pub fn ibus_alias(dbus_addr: u32) -> u32 {
         dbus_addr.wrapping_add(IBUS_ALIAS_OFFSET)
     }
@@ -131,19 +202,20 @@ impl Memory {
         None
     }
 
-    /// Copy `bytes` into the region covering `dbus_addr` (data write, ignores
-    /// the writable flag — this is loader setup, not guest execution).
-    pub fn load_bytes(&mut self, dbus_addr: u32, bytes: &[u8]) {
-        let (ri, idx) = self
-            .resolve(dbus_addr, Access::Data)
-            .unwrap_or_else(|| panic!("load_bytes: address {dbus_addr:#x} not mapped"));
-        let r = &mut self.regions[ri];
-        assert!(
-            idx + bytes.len() <= r.data.len(),
-            "load_bytes: {} bytes at {dbus_addr:#x} overruns region",
-            bytes.len()
-        );
-        r.data[idx..idx + bytes.len()].copy_from_slice(bytes);
+    /// Copy `bytes` into mapped memory starting at `addr` (data write, ignores
+    /// the writable flag — this is loader setup, not guest execution). `addr`
+    /// may be either view; each byte is resolved individually, so loading a
+    /// blob at contiguous **I-bus** addresses lands the bytes correctly even
+    /// under a word-mirrored alias (where the backing D-bus image is not
+    /// contiguous).
+    pub fn load_bytes(&mut self, addr: u32, bytes: &[u8]) {
+        for (i, b) in bytes.iter().enumerate() {
+            let a = addr.wrapping_add(i as u32);
+            let (ri, idx) = self
+                .resolve(a, Access::Data)
+                .unwrap_or_else(|| panic!("load_bytes: address {a:#x} not mapped"));
+            self.regions[ri].data[idx] = *b;
+        }
     }
 
     // --- fetch ---

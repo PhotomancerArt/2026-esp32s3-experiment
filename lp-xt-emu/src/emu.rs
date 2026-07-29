@@ -1,26 +1,32 @@
 //! The emulator: memory + CPU + the run loop and the windowed-ABI run harness.
 
+use crate::board::BoardProfile;
 use crate::cpu::Cpu;
 use crate::error::{Trap, TrapKind};
 use crate::memory::Memory;
 use crate::trace::{TraceEvent, Tracer};
 
-/// Where payload code is placed in the emulator's SRAM1 (D-bus address). The
-/// runner picks a heap address; we pick a fixed one inside the dual-mapped
-/// window. Code executes at the I-bus alias of this address.
+/// Where payload code is placed in the **ESP32-S3** profile's SRAM1 (D-bus
+/// address). The runner picks a heap address; we pick a fixed one inside the
+/// dual-mapped window. Code executes at the I-bus alias of this address.
+///
+/// S3-specific alias kept for existing consumers; profile-aware code reads
+/// [`BoardProfile`] (`emu.profile`) instead.
 pub const CODE_DBUS_BASE: u32 = 0x3FC8_8000;
-/// Size of the code region.
+/// Size of the S3 profile's code region.
 pub const CODE_REGION_LEN: usize = 0x0002_0000; // 128 KiB
-/// Stack region (D-bus). Separate SRAM1-mapped region; stack grows down from
-/// the top. Save areas produced by window spills live here.
+/// S3 profile's stack region (D-bus). Separate SRAM1-mapped region; stack
+/// grows down from the top. Save areas produced by window spills live here.
 pub const STACK_DBUS_BASE: u32 = 0x3FCC_0000;
 pub const STACK_REGION_LEN: usize = 0x0002_0000; // 128 KiB
-/// Initial stack pointer (top of the stack region, 16-aligned).
+/// S3 profile's initial stack pointer (top of the stack region, 16-aligned).
 pub const INITIAL_SP: u32 = STACK_DBUS_BASE + STACK_REGION_LEN as u32 - 16;
 
 /// Sentinel return address: when the top-level windowed function returns here,
-/// the run stops. Chosen unmapped and in the code region's high bits so the
-/// RETW address-unmangle reproduces it exactly (see `finish_call`).
+/// the run stops. Chosen unmapped (on both board profiles) and in the code
+/// region's high bits — every profile executes code in the `0x4xxx_xxxx`
+/// quadrant — so the RETW address-unmangle reproduces it exactly (see
+/// `finish_call`).
 pub const SENTINEL_PC: u32 = 0x4000_0000;
 
 /// Default instruction budget before a run is declared a [`TrapKind::Timeout`]
@@ -82,26 +88,36 @@ pub struct Emulator {
     pub mem: Memory,
     /// Instruction budget for [`RunOutcome::Trap`] timeout detection.
     pub step_budget: u64,
+    /// The board memory map this emulator was built on.
+    pub profile: BoardProfile,
 }
 
 impl Emulator {
-    /// Build an emulator with the standard S3 SRAM1 code + stack layout.
+    /// Build an emulator with the standard **ESP32-S3** layout — the default
+    /// board, so existing S3 code and tests are unchanged. Other boards go
+    /// through [`with_profile`](Self::with_profile).
     pub fn new() -> Emulator {
+        Emulator::with_profile(BoardProfile::esp32s3())
+    }
+
+    /// Build an emulator on an arbitrary board memory map.
+    pub fn with_profile(profile: BoardProfile) -> Emulator {
         let mut mem = Memory::new();
-        mem.add_sram1(CODE_DBUS_BASE, CODE_REGION_LEN);
-        mem.add_sram1(STACK_DBUS_BASE, STACK_REGION_LEN);
+        profile.install(&mut mem);
         Emulator {
             cpu: Cpu::new(),
             mem,
             step_budget: DEFAULT_STEP_BUDGET,
+            profile,
         }
     }
 
     /// Run `code` as `fn(arg) -> u32`, entered at `entry_offset` within the
-    /// blob, exactly as `xt-runner` does: the code is written to SRAM1 and
-    /// executed at its I-bus alias, and the entry is invoked via a synthesized
-    /// windowed CALL8 (arg staged in `a10`, arriving in the callee's `a2` after
-    /// its ENTRY). Uses a no-op tracer.
+    /// blob, exactly as the device runner does: the code is written into the
+    /// profile's code region so its executable image is I-bus-contiguous, and
+    /// the entry is invoked via a synthesized windowed CALL8 (arg staged in
+    /// `a10`, arriving in the callee's `a2` after its ENTRY). Uses a no-op
+    /// tracer.
     pub fn run(&mut self, code: &[u8], entry_offset: u32, arg: u32) -> RunOutcome {
         let mut t = crate::trace::NoopTracer;
         self.run_traced(code, entry_offset, arg, &mut t)
@@ -115,9 +131,14 @@ impl Emulator {
         arg: u32,
         tracer: &mut dyn Tracer,
     ) -> RunOutcome {
-        // Load code into SRAM1 at the fixed D-bus base; execute at the alias.
-        self.mem.load_bytes(CODE_DBUS_BASE, code);
-        let entry = Memory::ibus_alias(CODE_DBUS_BASE).wrapping_add(entry_offset);
+        // Load code at the I-bus base of the profile's code region — byte i of
+        // the blob lands at ibus_base + i. Under the S3's offset alias this is
+        // the same bytes as a D-bus write at CODE_DBUS_BASE; under classic's
+        // word-mirrored alias the backing D-bus image walks downward word by
+        // word, exactly as the device writer lays it out (FINDINGS C2b).
+        let ibus_base = self.profile.code_ibus_base();
+        self.mem.load_bytes(ibus_base, code);
+        let entry = ibus_base.wrapping_add(entry_offset);
         self.stage_windowed_entry(entry, arg);
         self.run_loop(tracer, None)
     }
@@ -144,16 +165,17 @@ impl Emulator {
         // return address into the caller's a8 and stages args in a10..; the
         // callee's ENTRY then rotates WindowBase by PS.CALLINC (=2), so a8→a0
         // and a10→a2.
+        let initial_sp = self.profile.initial_sp();
         self.cpu = Cpu::new();
         self.cpu.window_base = 0;
         self.cpu.window_start = 1; // frame 0 resident
         self.cpu.call_stack.push(crate::cpu::FrameRec {
             base: 0,
-            sp: INITIAL_SP,
+            sp: initial_sp,
             inc: 2,
             resident: true,
         });
-        self.cpu.set_a(1, INITIAL_SP); // caller SP
+        self.cpu.set_a(1, initial_sp); // caller SP
                                        // Mangled sentinel return address in a8: callinc=2 in top bits, sentinel
                                        // low bits. RETW unmangles to SENTINEL_PC (see finish_call).
         self.cpu.set_a(8, (2u32 << 30) | (SENTINEL_PC & 0x3FFF_FFFF));

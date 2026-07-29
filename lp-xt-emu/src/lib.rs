@@ -16,10 +16,18 @@
 //!
 //! ## Entry point
 //!
-//! [`Emulator::run`] loads a code blob into SRAM1 and invokes it exactly as the
-//! device runner does — via a synthesized windowed `CALL8`, arg in `a10`
-//! arriving in the callee's `a2` — returning a [`RunOutcome`].
+//! [`Emulator::run`] loads a code blob into the board's code region and invokes
+//! it exactly as the device runner does — via a synthesized windowed `CALL8`,
+//! arg in `a10` arriving in the callee's `a2` — returning a [`RunOutcome`].
+//!
+//! ## Boards
+//!
+//! The memory map is a [`BoardProfile`] ([`board`]): [`Emulator::new`] is the
+//! ESP32-S3 map (the default; every pre-profile consumer is unchanged), and
+//! [`Emulator::with_profile`]`(BoardProfile::esp32())` models the classic
+//! ESP32's word-mirrored SRAM1 (FINDINGS C2).
 
+pub mod board;
 pub mod cpu;
 pub mod emu;
 pub mod error;
@@ -28,6 +36,8 @@ pub mod trace;
 
 mod executor;
 
+pub use board::BoardProfile;
 pub use emu::{Emulator, RunOutcome, SyscallHandler, SyscallOutcome};
+pub use memory::AliasRule;
 pub use error::{Trap, TrapKind};
 pub use trace::{NoopTracer, TextTracer, TraceEvent, Tracer};
