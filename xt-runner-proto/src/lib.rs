@@ -1,6 +1,9 @@
 //! Wire protocol for `xt-runner`: send Xtensa code payloads to a resident
-//! ESP32-S3 firmware over USB-Serial-JTAG, execute them without reflashing, and
-//! get results or structured crash reports back.
+//! device firmware (ESP32-S3 over USB-Serial-JTAG, classic ESP32 over its
+//! UART bridge), execute them without reflashing, and get results or
+//! structured crash reports back. `DeviceInfo::chip` tells the host which
+//! board it is actually talking to, so a harness can verify a port matches
+//! the board it was configured for.
 //!
 //! Frames are COBS-encoded postcard (zero byte = frame delimiter), so the host
 //! can resynchronise after the device resets mid-frame following a crash.
@@ -16,7 +19,8 @@ use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 
 /// Bumped when the wire format changes incompatibly.
-pub const PROTO_VERSION: u32 = 1;
+/// v2: `DeviceInfo` gained `chip`.
+pub const PROTO_VERSION: u32 = 2;
 
 /// Host → device.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,9 +65,31 @@ pub enum ErrorCode {
     BadEntryOffset,
 }
 
+/// Which SOC the firmware was built for. Reported by the device (each
+/// firmware crate hardcodes its own), never told to it — so the host can
+/// detect a port wired to the wrong board.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Chip {
+    /// ESP32-S3 (Xtensa LX7).
+    Esp32S3,
+    /// Classic ESP32 (Xtensa LX6).
+    Esp32,
+}
+
+impl core::fmt::Display for Chip {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Chip::Esp32S3 => "esp32s3",
+            Chip::Esp32 => "esp32",
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceInfo {
     pub proto_version: u32,
+    /// The SOC this firmware runs on.
+    pub chip: Chip,
     pub heap_free: u32,
     pub max_payload: u32,
     pub boot_count: u32,

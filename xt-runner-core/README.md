@@ -3,8 +3,8 @@
 Board-agnostic core of the **xt-runner** payload firmware — the resident
 program that executes Xtensa machine-code payloads sent from a host, without
 reflashing. Per-SOC firmware crates (`fw/xt-runner-esp32s3`, and the classic
-`fw/xt-runner-esp32` from P3) are thin shells over this crate: they supply
-only what genuinely differs per chip.
+`fw/xt-runner-esp32`) are thin shells over this crate: they supply only what
+genuinely differs per chip (plus their own `Chip` id for `DeviceInfo`).
 
 `no_std + alloc`, builds on stable Rust as a host workspace member, so the
 ledger and dispatch logic are unit-tested off-device.
@@ -25,7 +25,7 @@ ledger and dispatch logic are unit-tested off-device.
 
 ## What each board supplies (the traits)
 
-| Trait | S3 | Classic ESP32 (P3) |
+| Trait | S3 | Classic ESP32 |
 |---|---|---|
 | `Transport` | USB-Serial-JTAG | UART0 through the USB-UART bridge |
 | `CodeMem` | heap buffer, executed at the `+0x6F_0000` I-bus alias | fixed SRAM1 region, word-writes through the **word-mirrored** D-bus view |

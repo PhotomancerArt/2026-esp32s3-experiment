@@ -91,6 +91,7 @@ fn main() -> ! {
         HeapAliasCodeMem::new(),
         RwdtWatchdog(rtc),
         ledger(),
+        xt_runner_proto::Chip::Esp32S3,
         || esp_alloc::HEAP.free() as u32,
     )
     .run()

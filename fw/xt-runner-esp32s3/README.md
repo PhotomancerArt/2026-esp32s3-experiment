@@ -26,7 +26,9 @@ Pure-binary channel: COBS-framed [postcard](https://docs.rs/postcard) messages
 Nothing else may write to the USB serial FIFO — hence no `esp-println`.
 
 - `Ping` → `Pong`
-- `Info` → `DeviceInfo { proto_version, heap_free, max_payload, boot_count }`
+- `Info` → `DeviceInfo { proto_version, chip, heap_free, max_payload, boot_count }`
+  (`chip: Esp32S3` — each firmware reports its own SOC, so the host can detect
+  a port wired to the wrong board)
 - `LoadExec { seq, entry_offset, arg, code }` → copy `code` into an executable
   buffer, call `(buf + entry_offset)(arg)` as `extern "C" fn(u32) -> u32`, reply
   `Ok { seq, result }`.

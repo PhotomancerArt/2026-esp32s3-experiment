@@ -1,10 +1,18 @@
-//! Host client for `xt-runner`: send Xtensa code payloads to the resident
-//! ESP32-S3 firmware over USB-Serial-JTAG and get back results or crash reports.
+//! Host client for `xt-runner`: send Xtensa code payloads to a resident
+//! runner firmware (ESP32-S3 over USB-Serial-JTAG, classic ESP32 over its
+//! USB-UART bridge at 115200) and get back results or crash reports.
+//! `DeviceInfo::chip` says which board a port actually talks to.
 //!
-//! The tricky part is crash recovery: when a payload faults or hangs, the device
-//! resets, which drops the USB-CDC port (it re-enumerates under the same name).
-//! [`Runner::load_exec`] handles that — it reopens the port and reads the
-//! unsolicited `CrashReport` the firmware emits on its next boot.
+//! The tricky part is crash recovery: when a payload faults or hangs, the
+//! device resets. What the host sees depends on the transport, and
+//! [`Runner::load_exec`] tolerates both:
+//!
+//! - **USB-CDC (S3)**: the port drops and re-enumerates under the same name —
+//!   reads error, so the client reopens the port and then reads the
+//!   unsolicited `CrashReport` the firmware emits on its next boot.
+//! - **UART bridge (classic)**: the port does NOT drop (FINDINGS C5) — reads
+//!   just go quiet during the reboot, then ROM boot noise arrives (skipped as
+//!   undecodable frames) followed by the `CrashReport`. No reopen happens.
 
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
@@ -52,10 +60,15 @@ impl Runner {
         })
     }
 
-    /// Open using the `XT_DEVICE_PORT` env var; returns `None` if unset (so
-    /// tests can skip hardware cleanly).
+    /// Open using the first set of `XT_DEVICE_PORT` (the S3 alias),
+    /// `XT_PORT_ESP32S3`, `XT_PORT_ESP32`; returns `None` if all are unset
+    /// (so tests can skip hardware cleanly). P5's N-run harness drives the
+    /// per-board vars individually; this helper just picks *a* board.
     pub fn from_env() -> Option<Result<Runner, Error>> {
-        std::env::var("XT_DEVICE_PORT").ok().map(|p| Runner::open(&p))
+        ["XT_DEVICE_PORT", "XT_PORT_ESP32S3", "XT_PORT_ESP32"]
+            .iter()
+            .find_map(|v| std::env::var(v).ok())
+            .map(|p| Runner::open(&p))
     }
 
     pub fn ping(&mut self) -> Result<(), Error> {
@@ -91,8 +104,10 @@ impl Runner {
             code,
         })?;
 
-        // Good path: a prompt Ok. Crash path: the port drops, the device
-        // reboots (~1-2s), and a Crash frame arrives on the reopened port.
+        // Good path: a prompt Ok. Crash path: the device reboots (~1-2s) and
+        // an unsolicited Crash frame arrives — over USB-CDC the port drops
+        // first (reads error → reopen below); over a UART bridge the port
+        // stays open and the frame simply shows up after the boot noise.
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             match self.recv_frame_until(deadline) {
@@ -178,7 +193,11 @@ impl Runner {
 }
 
 fn open_port(path: &str) -> Result<Box<dyn serialport::SerialPort>, serialport::Error> {
-    // USB-Serial-JTAG ignores baud; the value is a placeholder.
+    // 115200 is load-bearing on the classic ESP32's UART bridge (the firmware
+    // fixes UART0 at 115200 8N1); the S3's USB-Serial-JTAG ignores it.
+    // NOTE: opening a UART-bridge port can itself reset the board (DTR/RTS
+    // auto-reset wiring) — callers must not assume the device kept state
+    // across an open.
     serialport::new(path, 115_200)
         .timeout(Duration::from_millis(100))
         .open()

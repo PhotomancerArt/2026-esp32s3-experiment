@@ -1,8 +1,11 @@
-//! Hardware integration tests for xt-runner. Gated on `XT_DEVICE_PORT` — when
+//! Hardware integration tests for xt-runner. Gated on the port env vars
+//! (`XT_DEVICE_PORT` / `XT_PORT_ESP32S3` / `XT_PORT_ESP32`) — when all are
 //! unset (no board), every test is skipped so `cargo test` stays green on CI.
 //!
-//! Flash the runner first: `cd fw/xt-runner-esp32s3 && cargo run --release` (or espflash),
-//! then: `XT_DEVICE_PORT=/dev/cu.usbmodem1101 cargo test -p xt-runner-client -- --nocapture`
+//! Flash a runner first (`cd fw/xt-runner-esp32s3 && cargo run --release`, or
+//! `cd fw/xt-runner-esp32` for the classic board), then e.g.:
+//! `XT_PORT_ESP32=/dev/cu.usbserial-1440 cargo test -p xt-runner-client -- --test-threads=1 --nocapture`
+//! (single-threaded: the board is one shared resource).
 //!
 //! Payload bytes are objdump-derived (see the scratch payloads.s), never hand-recalled.
 
@@ -19,7 +22,7 @@ const HANG: &[u8] = &[0x36, 0x41, 0x00, 0x06, 0xff, 0xff];
 fn runner() -> Option<Runner> {
     match Runner::from_env() {
         None => {
-            eprintln!("XT_DEVICE_PORT unset — skipping hardware test");
+            eprintln!("no port env var (XT_DEVICE_PORT/XT_PORT_ESP32S3/XT_PORT_ESP32) — skipping hardware test");
             None
         }
         Some(Ok(r)) => Some(r),

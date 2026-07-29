@@ -8,7 +8,7 @@
 
 use alloc::vec::Vec;
 
-use xt_runner_proto::{DeviceInfo, ErrorCode, Request, Response, MAX_PAYLOAD, PROTO_VERSION};
+use xt_runner_proto::{Chip, DeviceInfo, ErrorCode, Request, Response, MAX_PAYLOAD, PROTO_VERSION};
 
 use crate::ledger::Ledger;
 
@@ -94,6 +94,8 @@ pub struct Runner<T: Transport, C: CodeMem, W: PayloadWatchdog> {
     codemem: C,
     watchdog: W,
     ledger: Ledger,
+    /// The SOC this firmware was built for, reported in `DeviceInfo::chip`.
+    chip: Chip,
     /// Board hook for `DeviceInfo::heap_free` (e.g. `esp_alloc::HEAP.free()`).
     heap_free: fn() -> u32,
     boot_count: u32,
@@ -104,13 +106,21 @@ pub struct Runner<T: Transport, C: CodeMem, W: PayloadWatchdog> {
 impl<T: Transport, C: CodeMem, W: PayloadWatchdog> Runner<T, C, W> {
     /// Reads the ledger (`Ledger::boot`) — call once per boot, after the
     /// firmware has initialised the heap and peripherals.
-    pub fn new(transport: T, codemem: C, watchdog: W, ledger: Ledger, heap_free: fn() -> u32) -> Self {
+    pub fn new(
+        transport: T,
+        codemem: C,
+        watchdog: W,
+        ledger: Ledger,
+        chip: Chip,
+        heap_free: fn() -> u32,
+    ) -> Self {
         let (boot_count, pending_crash) = ledger.boot();
         Runner {
             transport,
             codemem,
             watchdog,
             ledger,
+            chip,
             heap_free,
             boot_count,
             pending_crash,
@@ -166,6 +176,7 @@ impl<T: Transport, C: CodeMem, W: PayloadWatchdog> Runner<T, C, W> {
             Request::Info => {
                 let info = Response::Info(DeviceInfo {
                     proto_version: PROTO_VERSION,
+                    chip: self.chip,
                     heap_free: (self.heap_free)(),
                     // The protocol cap, further bounded by the board's code
                     // region (identical on S3, where the region is heap-backed).
