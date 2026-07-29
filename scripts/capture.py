@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Capture serial output from the S3 for N seconds and echo it.
+"""Capture serial output from a device for N seconds and echo it.
 
-Usage: capture.py [port] [seconds]
+Usage: capture.py [port] [seconds] [baud]
 
-Stdlib-only (termios) so it works without pyserial. USB-Serial-JTAG ignores
-baud settings. Retries opening the port briefly because the device
-re-enumerates after flashing/reset.
+Stdlib-only (termios) so it works without pyserial. Retries opening the port
+briefly because USB-Serial-JTAG devices (S3) re-enumerate after flashing/reset.
+
+Baud: USB-Serial-JTAG (S3) ignores baud settings — omit it. Boards behind a
+real USB-UART bridge (classic ESP32) DO care: pass 115200 explicitly, since
+the port otherwise keeps whatever speed the previous opener left behind.
 """
 
 import os
@@ -16,6 +19,7 @@ import time
 
 port = sys.argv[1] if len(sys.argv) > 1 else "/dev/cu.usbmodem1101"
 seconds = float(sys.argv[2]) if len(sys.argv) > 2 else 6.0
+baud = int(sys.argv[3]) if len(sys.argv) > 3 else None
 
 fd = None
 deadline_open = time.time() + 10.0
@@ -36,6 +40,9 @@ attrs = termios.tcgetattr(fd)
 attrs[0] = 0  # iflag
 attrs[1] = 0  # oflag
 attrs[3] = 0  # lflag
+if baud is not None:
+    attrs[4] = baud  # ispeed (macOS accepts numeric rates)
+    attrs[5] = baud  # ospeed
 termios.tcsetattr(fd, termios.TCSANOW, attrs)
 
 end = time.time() + seconds

@@ -42,18 +42,18 @@ fn main() -> ! {
         esp_alloc::HEAP.free()
     );
 
-    let boot = spike::e5::boot_ledger();
+    let boot = spike_esp32s3::e5::boot_ledger();
 
-    spike::e2::run();
-    spike::e3::run();
-    spike::e4::run();
-    spike::e5::measure();
+    spike_esp32s3::e2::run();
+    spike_esp32s3::e3::run();
+    spike_esp32s3::e4::run();
+    spike_esp32s3::e5::measure();
 
     if boot == 1 {
         // Give the serial monitor a moment, then prove the recovery tier.
         let delay_start = Instant::now();
         while delay_start.elapsed() < Duration::from_millis(1500) {}
-        spike::e5::intentional_panic();
+        spike_esp32s3::e5::intentional_panic();
     }
 
     loop {

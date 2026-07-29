@@ -2,33 +2,41 @@
 edition      = "2021"
 # Crate named without the year prefix: rustc crate names must be valid
 # identifiers and cannot start with a digit (repo/dir name keeps the year).
-name         = "spike"
+name         = "spike-esp32"
 license      = "MIT"
 rust-version = "1.86"
 version      = "0.1.0"
 
 [[bin]]
-name = "spike"
+name = "spike-esp32"
 path = "./src/bin/main.rs"
 
 [dependencies]
-esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"] }
-esp-hal                = { version = "1.1.1", features = ["esp32s3", "log-04", "unstable"] }
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32"] }
+esp-hal                = { version = "1.1.1", features = ["esp32", "log-04", "unstable"] }
 log                    = "0.4.27"
 
 critical-section = "1.2.0"
 esp-alloc = { version = "0.10.0", features = ["internal-heap-stats"] }
 portable-atomic = { version = "1", default-features = false }
+# Classic ESP32 has no USB-Serial-JTAG: print over UART0 through the on-board
+# USB-UART bridge (115200 baud — a real UART, so baud matters, unlike USB-CDC).
 esp-println = { version = "0.17.0", default-features = false, features = [
-  "esp32s3",
-  "jtag-serial",
+  "esp32",
+  "uart",
   "log-04",
 ] }
 
 [features]
-# E2D: deliberately execute at the D-bus address (expected fault); build with
-# --features identity-probe for one sacrificial run to record the exception.
-identity-probe = []
+# Sacrificial fault probes. Each is EXPECTED to raise a CPU exception (which
+# panics via esp-hal's exception-handler, printing a context dump, then our
+# panic handler reboots — so the firmware reboot-loops). Flash once with one
+# feature to record the exception, then reflash without.
+#
+# probe-iram-byte:     byte-granularity store to SRAM0 IRAM (word-only bus?).
+# probe-identity-exec: execute from a D-bus SRAM1 address (I-fetch there?).
+probe-iram-byte = []
+probe-identity-exec = []
 
 [profile.dev]
 # Rust debug is too slow.

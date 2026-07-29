@@ -329,5 +329,189 @@ LLVM MC deduped the reference's second literal out of the blob.
 ## What this spike did NOT test
 
 - ws281x/RMT LED driving, serial comms protocol, radio/ESP-NOW (explicitly deferred)
-- classic ESP32 (LX6) — S3 only
+- classic ESP32 (LX6) — S3 only (since covered: see the classic C1–C5 section below)
 - performance of JIT'd code; PSRAM; real codegen from LPIR
+
+---
+
+# Findings — classic ESP32 (LX6) experiment ladder (C1–C5)
+
+Run 2026-07-28 on real hardware (`fw/spike-esp32`), mirroring the S3 spike's
+E1–E5 for the classic chip. Central question: how does classic ESP32 execute
+dynamically written code, given that S3's "the heap is executable" does not
+hold. Answered empirically below.
+
+## Verdict table
+
+| # | Experiment | Verdict | Detail |
+|---|---|---|---|
+| C1 | Toolchain + HAL + UART bridge | **PASS** | [C1](#c1--toolchain-hal-uart) |
+| C2 | Code-execution model discovery | **PASS** | [C2](#c2--the-classic-code-execution-model) |
+| C3 | CALLX8 + L32R pool builtin call (GV2) | **PASS** | [C3](#c3--windowed-abi-on-lx6) |
+| C4 | Window overflow/underflow depth 100 (GV3a/b) | **PASS** | [C4](#c4--window-machinery-on-lx6) |
+| C5 | Abort-tier recovery + measurements | **PASS** | [C5](#c5--recovery-tier--measurements) |
+
+**Headline: all three candidate regions execute dynamically written code, the
+LX7-assembled golden vectors ran byte-for-byte unmodified on LX6, and the only
+new constraints are (a) SRAM1's word-*mirrored* dual mapping and (b) word-only
+data access to I-bus addresses.**
+
+## Board identity (the classic desk unit)
+
+`espflash board-info`:
+
+```text
+Chip type:         esp32 (revision v3.0)
+Crystal frequency: 40 MHz
+Flash size:        4MB
+Features:          WiFi, BT, Dual Core, 240MHz, VRef calibration in efuse, Coding Scheme None
+MAC address:       94:b5:55:c8:c8:c4
+```
+
+Matches the project floor pin (4MB flash, no PSRAM). Port
+`/dev/cu.usbserial-1440` — a **USB-UART bridge**, no native USB.
+
+## C1 — toolchain, HAL, UART
+
+**PASS.** `C1: PASS esp_hal=1.1.1 chip=esp32 heap_free=98304`. Same espup
+toolchain and crate cohort as the S3 spike (esp-hal 1.1.1 with `esp32`
+feature, esp-bootloader-esp-idf/esp32, esp-alloc 0.10.0, esp-println 0.17.0
+with `esp32` + `uart`); the only per-chip changes are feature names, the
+`xtensa-esp32-none-elf` target, and `espflash --chip esp32`.
+
+Two UART findings that cost real debugging time:
+
+- **esp-println's `uart` feature writes the UART0 FIFO and never programs the
+  baud divisor.** The ROM leaves a divisor for its own clock tree; after
+  `esp_hal::init()` reclocks (CpuClock::max), output becomes garbage at every
+  standard baud. Fix: construct `esp_hal::uart::UartTx` (115200 8N1, GPIO1)
+  once at boot and keep it alive; esp-println's raw FIFO writes then go out at
+  115200. The S3 never saw this because USB-Serial-JTAG has no baud.
+- `scripts/capture.py` gained an optional third arg (baud): a real bridge
+  keeps whatever speed the previous opener left, so captures must pin 115200.
+
+## C2 — the classic code-execution model
+
+**PASS — this is the deliverable.** Probes: read-backs first (distinct
+sentinels, multiple offsets), then GV1 execution per region, plus two
+sacrificial fault probes. Serial evidence (condensed; full lines in the run
+log format `C2a/b/c/x/n/f/g`):
+
+```text
+C2a: PASS rtc_mapping=1to1
+C2b: MEASURE off=0x0 want=0xc0de0000 h1@0x400b0000=0x58503a2b h2@0x400afffc=0xc0de0000
+C2b: MEASURE off=0x100 want=0xc0de0100 h1@0x400b0100=0x80511dad h2@0x400afefc=0xc0de0100
+C2b: PASS sram1_rule=word_mirrored iram=0x400BFFFC-(dram-0x3FFE0000)
+C2c: PASS word_write=ok got0=0xf00dface got1=0x1badb002
+C2x: PASS region=rtc_fast value=42 exec_addr=0x400c1900
+C2x: PASS region=sram0 value=42 exec_addr=0x4009c100
+C2x: PASS region=sram1_word_mirrored value=42 exec_addr=0x400b0800
+C2n: PASS region=sram1_word_mirrored value=42 exec_addr=0x400b0900  (barriers=none)
+```
+
+The model, in precise terms:
+
+| Region | Write via | Execute at | Address rule | Usable (this fw) |
+|---|---|---|---|---|
+| **SRAM1** | D-bus `0x3FFE_0000..0x4000_0000` (any width) | I-bus `0x400A_0000..0x400C_0000` | **word-mirrored**: `iram = 0x400B_FFFC − (dram − 0x3FFE_0000)` | ~96KB free (dram2_seg `0x3FFE_7E30..0x3FFF_FF80`; lower SRAM1 is ROM-data/stack reservations, partially reclaimable) |
+| **SRAM0** | its own I-bus address, **32-bit aligned words only** | same address (identity) | `iram = iram` — no D-bus view exists | ~125KB (128KB iram_seg minus ~5.4KB of vectors + `.rwtext`) |
+| **RTC fast** | D-bus `0x3FF8_0000 + off` (any width) | I-bus `0x400C_0000 + off` | clean 1:1, `iram = dram + 0xC4_0000` | 8KB minus the ledger (PRO_CPU only) |
+| SRAM2 (dram_seg, the heap) | D-bus | — | **not executable** — no I-bus view | n/a for code |
+
+- **SRAM1 is genuinely word-mirrored** — H1 (linear) read garbage at all 5
+  probe offsets, H2 matched all 5, so the two windows run in opposite
+  directions at word granularity. Consequence for code layout: writing
+  I-contiguous code means walking the D-bus **downward** word by word. The
+  spike's `CodeSpot` writer keys everything on the I-bus layout (word `i` of
+  code at `iram_base + 4i`) and computes the write address per word, which
+  absorbs the mirroring in one line of address math. Bytes within each 32-bit
+  word are NOT swapped (the little-endian words are verbatim).
+- **Word-only access to I-bus addresses**: aligned 32-bit stores/loads to
+  SRAM0 work; a byte store faults —
+  `C2f` → `LoadStoreError, EXCCAUSE=3, EXCVADDR=0x4009C001` (full context
+  dump captured). Emit code as word-aligned u32 volatile writes, zero-padded.
+- **D-bus addresses are not fetchable**: `C2g` executing GV1 at its D-bus
+  address `0x3FFF_0400` → `InstrError, EXCCAUSE=2, PC=EXCVADDR=0x3FFF0400` —
+  exact mirror of the S3's E2D.
+- **No barriers required** (C2n: fresh code executed with no `memw`/`isync`,
+  internal SRAM uncached, same as S3) — keep the belt-and-suspenders
+  `memw + isync` after emission anyway, cost is nil.
+- No PMS/memprot obstacle bare-metal, same as S3: nothing configured, all
+  three regions fetch freshly written RAM.
+
+## C3 — windowed ABI on LX6
+
+**PASS.** `C3A: PASS result=126` (toolchain-assembled flash reference), then
+`C3: PASS result=126 region=sram1_word_mirrored builtin_addr=0x400d9998` —
+GV2 (pool-before-code, runtime-patched literal, `l32r` imm16=−2, CALLX8 into
+a windowed Rust builtin, arg staging a10→a2 and return a2→a10) ran **byte-for-
+byte unmodified** from mirrored-SRAM1. RAM-resident code calling
+flash-resident code (0x400B… → 0x400D…) crosses regions with no issue.
+
+## C4 — window machinery on LX6
+
+**PASS.** `C4A: PASS depth=100 result=100 sp=0x3ffdfe90`, then from
+mirrored-SRAM1: `C4: PASS depth=100 result=100 mixed=121` with a depth sweep
+1..32 all-correct (first spill ~depth 6 per the CALL8 model; the spill itself
+is architecturally invisible — correctness at every depth is the observable).
+Same `_WindowOverflow/Underflow` vectors as S3 (xtensa-lx-rt 0.22.0 via
+esp-hal). JIT-emitted ENTRY frames are first-class on LX6 exactly as on LX7.
+
+## C5 — recovery tier + measurements
+
+**PASS.** Full cycle in one capture:
+
+```text
+C5: MEASURE heap_free=98304
+C5: MEASURE arena_64k=ok heap_free_after=32768
+C5: MEASURE largest_block~=97600
+PANIC (rebooting, blame recorded): panicked at src/c5.rs:85:5:
+C5 intentional panic (code 0xdead0001)
+rst:0x3 (SW_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+C5: PASS ledger_survived=true boot_count=2 prev_code=0xdead0001 prev_line=85
+```
+
+- `#[esp_hal::ram(unstable(rtc_fast, persistent))]` **works unchanged on
+  classic** (RTC fast here is 8KB at DRAM `0x3FF8_0000` / IRAM `0x400C_0000`,
+  PRO_CPU only); the ledger survives software resets and reflashes.
+- Heap: 96KB configured (classic dram_seg is only 192KB — SRAM2 — vs S3's
+  345KB); free=98304 at boot, 64KB arena drops it by exactly 65536, largest
+  block ≈ 97600. The JIT arena itself will NOT come from this heap on classic
+  (not executable) — code goes to SRAM1/SRAM0 directly.
+- Flash image: 105,104 bytes into a 4MB-table factory partition (3,932,160 B).
+- **UART bridge reset behavior (P3 cares)**: the serial port does **not**
+  drop across device resets — a single open capture spanned panic → SW reset
+  → boot 2. But *opening* the port can itself reset the board (DTR/RTS
+  auto-reset wiring), so deterministic full-boot captures should use
+  `espflash reset` with the port already open, and hosts must not treat
+  "port stayed open" as "device never rebooted".
+- **New gotcha**: `software_reset()` immediately after a println truncates
+  the message — the UART TX FIFO doesn't drain (USB-CDC on S3 was immune).
+  The panic handler must wait (~300ms covers a full exception dump at
+  115200) before resetting, or the fault report is lost.
+
+## LX6 vs LX7 divergences observed
+
+**None in the executed instruction set.** Specifically:
+
+- GV1/GV2/GV3a/GV3b (assembled for LX7 on the S3 spike) ran **unmodified** on
+  LX6, and re-assembling their shapes with `xtensa-esp32-elf-as` (LX6 GCC
+  assembler) produces byte-identical encodings for every wide-form
+  instruction (`entry`, wide `movi`, `l32r`, `callx8`, wide `or`/`mov`, wide
+  `addi`, `beqz`, `retw`). One cosmetic toolchain difference: GNU as defaults
+  to narrow `.n` forms where LLVM MC chose wide forms — both encodings are
+  legal on both cores (density option present on each).
+- The windowed ABI (rotation, arg staging, spill/reload) behaved identically.
+- The divergence is all in the **memory system**, not the core: S3 =
+  uniform `+0x6F_0000` dual mapping, heap executable; classic = per-block
+  buses, word-mirrored SRAM1, word-only I-bus data access, heap NOT
+  executable.
+
+## Consequence for the multi-board runner (P2+)
+
+A payload runner comparable to the S3's is supported: ~96KB of
+mirrored-SRAM1 (more if ROM reservations are reclaimed) or ~125KB of SRAM0
+dwarf the 8KB RTC-fast ceiling. The runner's code memory abstraction must be
+an I-bus-keyed word writer (the `CodeSpot` shape in
+`fw/spike-esp32/src/codemem.rs`) rather than S3's "alias offset on a heap
+pointer" — that is exactly the per-SOC trait boundary P2 plans for.
