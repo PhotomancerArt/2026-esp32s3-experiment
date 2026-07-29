@@ -23,8 +23,8 @@
 //!    and a collision tracer asserts (a) spills/reloads actually fired and
 //!    (b) no program store ever touched a byte the handlers spilled to.
 //!
-//! Hardware tests share ONE board — run single-threaded:
-//!   XT_DEVICE_PORT=/dev/cu.usbmodem1101 cargo test -p xt-mini-emit -- --test-threads=1 --nocapture
+//! Hardware tests share the boards — run single-threaded:
+//!   XT_PORT_ESP32S3=... XT_PORT_ESP32=... cargo test -p xt-mini-emit -- --test-threads=1 --nocapture
 
 use lp_xt_emu::emu::RunOutcome as EmuOutcome;
 use lp_xt_emu::trace::TraceEvent;
@@ -35,48 +35,16 @@ use xt_mini_emit::{
     emit_program_with, gpr, AluImmOp, AluOp, CallInc, Callee, MiniFunc, MiniProgram, MiniVInst,
     PReg,
 };
-use xt_runner_client::{RunOutcome as HwOutcome, Runner};
+use xt_testkit::Harness;
 
 use MiniVInst::{AluRRI, AluRRR, BrIf, Call, IConst32, Label, Load32, Ret, SlotAddr, Store32};
 
 // ---------------------------------------------------------------------------
-// Harness (pattern shared with tests/call_inc_study.rs)
+// Harness (shared: xt-testkit N-runs each case on every profile + board)
 // ---------------------------------------------------------------------------
 
-fn device() -> Option<Runner> {
-    match Runner::from_env() {
-        None => {
-            eprintln!("XT_DEVICE_PORT unset — emulator-only (no hardware conformance)");
-            None
-        }
-        Some(Ok(r)) => Some(r),
-        Some(Err(e)) => panic!("failed to open device: {e}"),
-    }
-}
-
-fn measure(
-    device: &mut Option<Runner>,
-    seq: &mut u32,
-    name: &str,
-    code: &[u8],
-    entry_offset: u32,
-    arg: u32,
-    expect: u32,
-) {
-    let mut emu = Emulator::new();
-    match emu.run(code, entry_offset, arg) {
-        EmuOutcome::Ok(v) => assert_eq!(v, expect, "[{name}] emu result (arg={arg})"),
-        other => panic!("[{name}] emu outcome {other:?}, expected Ok({expect}) (arg={arg})"),
-    }
-    let Some(dev) = device.as_mut() else { return };
-    *seq += 1;
-    let hw = dev
-        .load_exec(*seq, code.to_vec(), entry_offset, arg)
-        .unwrap_or_else(|e| panic!("[{name}] device load_exec failed: {e}"));
-    match hw {
-        HwOutcome::Ok(h) => assert_eq!(h, expect, "[{name}] EMU vs HW diff (arg={arg})"),
-        HwOutcome::Crash(r) => panic!("[{name}] device crashed (arg={arg}): {r:?}"),
-    }
+fn measure(h: &mut Harness, name: &str, code: &[u8], entry_offset: u32, arg: u32, expect: u32) {
+    h.nrun(name, code, entry_offset, arg, expect);
 }
 
 fn p(n: u8) -> PReg {
@@ -273,15 +241,14 @@ fn live_call_expect(arg: u32, n: usize) -> u32 {
 
 #[test]
 fn pressure_characterization() {
-    let mut dev = device();
-    let mut seq = 9000u32;
+    let mut h = Harness::from_env(9000);
 
     // Across arithmetic: the achievable pool is ALLOC_POOL's 12 (vs rv32 13).
     for n in [4usize, 8, 12, 16, 20] {
         let (code, entry, expect) = build_live_arith(n);
         let regs = n.min(gpr::ALLOC_POOL.len());
         let slots = n - regs;
-        measure(&mut dev, &mut seq, &format!("live-arith-{n}"), &code, entry, 0, expect);
+        measure(&mut h, &format!("live-arith-{n}"), &code, entry, 0, expect);
         eprintln!(
             "MEASURE pressure-arith live={n} regs={regs} spill_slots={slots} \
              (pool={} vs rv32 13)",
@@ -298,9 +265,7 @@ fn pressure_characterization() {
         for arg in [0u32, 5, 0xFFFF_FF00] {
             let name = format!("live-call-{n}");
             measure(
-                &mut dev,
-                &mut seq,
-                &name,
+                &mut h, &name,
                 &out.code,
                 out.entry_offset,
                 arg,
@@ -313,7 +278,10 @@ fn pressure_characterization() {
         );
     }
 
-    eprintln!("pressure_characterization: all cases passed (device={})", dev.is_some());
+    eprintln!(
+        "pressure_characterization: all cases passed (boards={})",
+        h.boards.len()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -484,16 +452,10 @@ fn spill_onset(inc: CallInc) -> u32 {
 }
 
 /// One matrix case: emulator run with the collision tracer (result, handler
-/// activity, and address disjointness asserted), then a hardware dual-run.
-#[allow(clippy::too_many_arguments)]
-fn torture_case(
-    dev: &mut Option<Runner>,
-    seq: &mut u32,
-    inc: CallInc,
-    s_live: usize,
-    pad: u32,
-    depth: u32,
-) {
+/// activity, and address disjointness asserted — the tracer analysis is
+/// profile-independent, so one traced run on the default profile suffices),
+/// then the full N-run (every profile + every board) via the harness.
+fn torture_case(h: &mut Harness, inc: CallInc, s_live: usize, pad: u32, depth: u32) {
     let name = format!("collide-{}-s{s_live}-p{pad}-d{depth}", inc_name(inc));
     let out = emit_program_with(&prog_rec_slots(s_live, pad), inc);
     assert!(out.sym_slots.is_empty());
@@ -525,22 +487,12 @@ fn torture_case(
         tr.store_ranges.len()
     );
 
-    if let Some(d) = dev.as_mut() {
-        *seq += 1;
-        let hw = d
-            .load_exec(*seq, out.code.clone(), out.entry_offset, depth)
-            .unwrap_or_else(|e| panic!("[{name}] device load_exec failed: {e}"));
-        match hw {
-            HwOutcome::Ok(h) => assert_eq!(h, depth, "[{name}] HW slot/register corruption"),
-            HwOutcome::Crash(rp) => panic!("[{name}] device crashed: {rp:?}"),
-        }
-    }
+    h.nrun(&name, &out.code, out.entry_offset, depth, depth);
 }
 
 #[test]
 fn spill_save_area_collision_torture() {
-    let mut dev = device();
-    let mut seq = 9500u32;
+    let mut h = Harness::from_env(9500);
 
     // Primary matrix under the CALL8 policy: slot count x depth. Depths
     // straddle the measured overflow onset (6) and wrap the 64-register file
@@ -548,7 +500,7 @@ fn spill_save_area_collision_torture() {
     // 10x the save-area reservation.
     for s_live in [1usize, 2, 4, 8, 16, 64] {
         for depth in [1u32, 5, 8, 17, 33, 100] {
-            torture_case(&mut dev, &mut seq, CallInc::Call8, s_live, 0, depth);
+            torture_case(&mut h, CallInc::Call8, s_live, 0, depth);
         }
     }
 
@@ -556,7 +508,7 @@ fn spill_save_area_collision_torture() {
     // slots moves them up against (and away from) the reserved top region.
     for (s_live, pad) in [(1usize, 100u32), (1, 244), (16, 100), (16, 244)] {
         for depth in [8u32, 100] {
-            torture_case(&mut dev, &mut seq, CallInc::Call8, s_live, pad, depth);
+            torture_case(&mut h, CallInc::Call8, s_live, pad, depth);
         }
     }
 
@@ -565,13 +517,13 @@ fn spill_save_area_collision_torture() {
     for inc in [CallInc::Call4, CallInc::Call12] {
         for s_live in [1usize, 16] {
             for depth in [8u32, 33, 100] {
-                torture_case(&mut dev, &mut seq, inc, s_live, 0, depth);
+                torture_case(&mut h, inc, s_live, 0, depth);
             }
         }
     }
 
     eprintln!(
-        "spill_save_area_collision_torture: all cases passed (device={})",
-        dev.is_some()
+        "spill_save_area_collision_torture: all cases passed (boards={})",
+        h.boards.len()
     );
 }

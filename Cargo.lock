@@ -162,6 +162,7 @@ dependencies = [
  "lp-xt-inst",
  "xt-runner-client",
  "xt-runner-proto",
+ "xt-testkit",
 ]
 
 [[package]]
@@ -461,6 +462,7 @@ dependencies = [
  "lp-xt-inst",
  "xt-runner-client",
  "xt-runner-proto",
+ "xt-testkit",
 ]
 
 [[package]]
@@ -487,4 +489,14 @@ version = "0.1.0"
 dependencies = [
  "postcard",
  "serde",
+]
+
+[[package]]
+name = "xt-testkit"
+version = "0.1.0"
+dependencies = [
+ "lp-xt-emu",
+ "lp-xt-inst",
+ "xt-runner-client",
+ "xt-runner-proto",
 ]

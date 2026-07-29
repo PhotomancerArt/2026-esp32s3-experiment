@@ -1,7 +1,7 @@
 //! P1 — CALL-increment policy study (measurement rig).
 //!
-//! Measures, for CALL4/CALL8/CALL12, on the emulator and (when
-//! `XT_DEVICE_PORT` is set) on the real ESP32-S3:
+//! Measures, for CALL4/CALL8/CALL12, on the emulator (every board profile)
+//! and on every attached board (`XT_PORT_ESP32S3` / `XT_PORT_ESP32`):
 //!
 //! 1. **Register-argument capacity** — how many arguments actually pass in
 //!    registers (and that programs beyond the capacity refuse to emit).
@@ -14,8 +14,8 @@
 //!
 //! Results + recommendation: `xt-mini-emit/docs/call-inc-study.md`.
 //!
-//! Hardware tests share ONE board — run single-threaded:
-//!   XT_DEVICE_PORT=/dev/cu.usbmodem1101 cargo test -p xt-mini-emit -- --test-threads=1 --nocapture
+//! Hardware tests share the boards — run single-threaded:
+//!   XT_PORT_ESP32S3=... XT_PORT_ESP32=... cargo test -p xt-mini-emit -- --test-threads=1 --nocapture
 
 use lp_xt_emu::emu::RunOutcome as EmuOutcome;
 use lp_xt_emu::{Emulator, TextTracer};
@@ -25,7 +25,7 @@ use xt_mini_emit::{
     emit_program_with, AluImmOp, AluOp, CallInc, Callee, EmitOut, IcmpCond, MiniFunc, MiniProgram,
     MiniVInst, PReg,
 };
-use xt_runner_client::{RunOutcome as HwOutcome, Runner};
+use xt_testkit::Harness;
 
 use MiniVInst::{AluRRI, AluRRR, BrIf, Call, IConst32, IcmpImm, Label, Ret};
 
@@ -40,87 +40,15 @@ fn func(slots: Vec<u32>, insts: Vec<MiniVInst>) -> MiniFunc {
 }
 
 // ---------------------------------------------------------------------------
-// Harness (pattern shared with tests/dual_run.rs)
+// Harness (shared: xt-testkit N-runs each case on every profile + board;
+// `Harness::measure` = every world must agree on the value, which is the
+// *measurement*; `Harness::run_all` = per-world values for predicate-only
+// comparisons)
 // ---------------------------------------------------------------------------
 
-fn device() -> Option<Runner> {
-    match Runner::from_env() {
-        None => {
-            eprintln!("XT_DEVICE_PORT unset — emulator-only (no hardware conformance)");
-            None
-        }
-        Some(Ok(r)) => Some(r),
-        Some(Err(e)) => panic!("failed to open device: {e}"),
-    }
-}
-
-/// Run on the emulator, and (with a device) on hardware; the two must agree.
-/// Returns the agreed result — the *measurement*, not an assertion of it.
-fn measure(
-    device: &mut Option<Runner>,
-    seq: &mut u32,
-    name: &str,
-    code: &[u8],
-    entry_offset: u32,
-    arg: u32,
-) -> u32 {
-    let mut emu = Emulator::new();
-    let got = match emu.run(code, entry_offset, arg) {
-        EmuOutcome::Ok(v) => v,
-        other => panic!("[{name}] emu outcome {other:?} (arg={arg})"),
-    };
-    if let Some(dev) = device.as_mut() {
-        *seq += 1;
-        let hw = dev
-            .load_exec(*seq, code.to_vec(), entry_offset, arg)
-            .unwrap_or_else(|e| panic!("[{name}] device load_exec failed: {e}"));
-        match hw {
-            HwOutcome::Ok(h) => assert_eq!(h, got, "[{name}] EMU vs HW diff (arg={arg})"),
-            HwOutcome::Crash(r) => panic!("[{name}] device crashed (arg={arg}): {r:?}"),
-        }
-    }
-    got
-}
-
-/// As [`measure`], but without requiring emulator and hardware to return the
-/// same raw value — used where the value is position-dependent (a clobbered
-/// register holding a mangled return address or SP differs by load address)
-/// and only a predicate of it is the measurement.
-fn run_both(
-    device: &mut Option<Runner>,
-    seq: &mut u32,
-    name: &str,
-    code: &[u8],
-    entry_offset: u32,
-    arg: u32,
-) -> (u32, Option<u32>) {
-    let mut emu = Emulator::new();
-    let emu_got = match emu.run(code, entry_offset, arg) {
-        EmuOutcome::Ok(v) => v,
-        other => panic!("[{name}] emu outcome {other:?} (arg={arg})"),
-    };
-    let hw_got = device.as_mut().map(|dev| {
-        *seq += 1;
-        match dev
-            .load_exec(*seq, code.to_vec(), entry_offset, arg)
-            .unwrap_or_else(|e| panic!("[{name}] device load_exec failed: {e}"))
-        {
-            HwOutcome::Ok(h) => h,
-            HwOutcome::Crash(r) => panic!("[{name}] device crashed (arg={arg}): {r:?}"),
-        }
-    });
-    (emu_got, hw_got)
-}
-
-fn measure_out(
-    device: &mut Option<Runner>,
-    seq: &mut u32,
-    name: &str,
-    out: &EmitOut,
-    arg: u32,
-) -> u32 {
+fn measure_out(h: &mut Harness, name: &str, out: &EmitOut, arg: u32) -> u32 {
     assert!(out.sym_slots.is_empty(), "[{name}] must be position-independent");
-    measure(device, seq, name, &out.code, out.entry_offset, arg)
+    h.measure(name, &out.code, out.entry_offset, arg)
 }
 
 fn inc_name(inc: CallInc) -> &'static str {
@@ -187,8 +115,7 @@ fn nargs_expect(a: u32, n: usize) -> u32 {
 
 #[test]
 fn arg_capacity() {
-    let mut dev = device();
-    let mut seq = 5000u32;
+    let mut h = Harness::from_env(5000);
     let args = [0u32, 5, 1000, 0xFFFF_FFF0];
 
     for inc in INCS {
@@ -197,7 +124,7 @@ fn arg_capacity() {
             let out = emit_program_with(&prog_nargs(n), inc);
             for a in args {
                 let name = format!("nargs-{}-{n}", inc_name(inc));
-                let got = measure_out(&mut dev, &mut seq, &name, &out, a);
+                let got = measure_out(&mut h, &name, &out, a);
                 assert_eq!(got, nargs_expect(a, n), "[{name}] wrong fold (a={a})");
             }
         }
@@ -291,8 +218,7 @@ fn raw_probe(inc: CallInc, r: u8) -> (Vec<u8>, u32, u32) {
 
 #[test]
 fn preserved_temporaries() {
-    let mut dev = device();
-    let mut seq = 6000u32;
+    let mut h = Harness::from_env(6000);
 
     for inc in INCS {
         let mut survived: Vec<u8> = Vec::new();
@@ -300,7 +226,7 @@ fn preserved_temporaries() {
         for r in 2u8..=7 {
             let out = emit_program_with(&prog_probe_low(r), inc);
             let name = format!("probe-{}-a{r}", inc_name(inc));
-            let got = measure_out(&mut dev, &mut seq, &name, &out, 0);
+            let got = measure_out(&mut h, &name, &out, 0);
             assert!(got <= 1, "[{name}] probe must return 0/1, got {got}");
             if got == 1 {
                 survived.push(r);
@@ -309,19 +235,20 @@ fn preserved_temporaries() {
         // a8..=a15 through raw (encode-built) programs. The raw post-call
         // value of a clobbered register can be position-dependent (e.g. under
         // CALL8, a8 comes back holding the mangled return address — top bits
-        // 0b10 = CALLINC 2 — whose low bits differ by load address), so the
-        // survived/clobbered *predicate* is what emulator and hardware must
-        // agree on, not the raw value.
+        // 0b10 = CALLINC 2 — whose low bits differ by load address, and so by
+        // world), so the survived/clobbered *predicate* is what every world
+        // must agree on, not the raw value.
         for r in 8u8..=15 {
             let (code, entry, k) = raw_probe(inc, r);
             let name = format!("rawprobe-{}-a{r}", inc_name(inc));
-            let (emu_got, hw_got) = run_both(&mut dev, &mut seq, &name, &code, entry, 0);
-            let alive = emu_got == k;
-            if let Some(h) = hw_got {
+            let results = h.run_all(&name, &code, entry, 0);
+            let alive = results[0].1 == k;
+            for (world, v) in &results[1..] {
                 assert_eq!(
-                    h == k,
+                    *v == k,
                     alive,
-                    "[{name}] EMU vs HW survival disagree (emu={emu_got:#010x} hw={h:#010x} k={k:#x})"
+                    "[{name}] survival disagree: {}={:#010x} vs {world}={v:#010x} (k={k:#x})",
+                    results[0].0, results[0].1
                 );
             }
             if alive {
@@ -389,8 +316,7 @@ fn prog_recursion() -> MiniProgram {
 
 #[test]
 fn window_overflow_onset() {
-    let mut dev = device();
-    let mut seq = 7000u32;
+    let mut h = Harness::from_env(7000);
 
     for inc in INCS {
         let out = emit_program_with(&prog_recursion(), inc);
@@ -430,7 +356,7 @@ fn window_overflow_onset() {
             // across the onset (trap counts come from the silicon-validated
             // emulator; the device has no tracer).
             let name = format!("recursion-{}-d{d}", inc_name(inc));
-            let got = measure_out(&mut dev, &mut seq, &name, &out, d);
+            let got = measure_out(&mut h, &name, &out, d);
             assert_eq!(got, d, "[{name}] f(d) != d");
         }
         let onset = onset.expect("depth 40 must overflow under every increment");

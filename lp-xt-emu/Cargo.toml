@@ -15,3 +15,6 @@ lp-xt-inst = { path = "../lp-xt-inst" }
 [dev-dependencies]
 xt-runner-client = { path = "../xt-runner-client" }
 xt-runner-proto = { path = "../xt-runner-proto" }
+# Dev-dep cycle (xt-testkit depends on lp-xt-emu) is fine: dev-dependencies
+# never enter the library build graph.
+xt-testkit = { path = "../xt-testkit" }

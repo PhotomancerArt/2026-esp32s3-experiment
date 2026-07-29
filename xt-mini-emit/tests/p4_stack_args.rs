@@ -17,8 +17,9 @@
 //! - **Multi-return**: 2 words return direct in callee `a2, a3` -> caller
 //!   `a10, a11` (`RET_REGS` / `CALL_RET_REGS`).
 //!
-//! Every program here is position-independent and dual-runs: emulator always,
-//! plus the real ESP32-S3 when `XT_DEVICE_PORT` is set (single-threaded:
+//! Every program here is position-independent and N-runs (P5): emulator on
+//! every board profile always, plus every attached board
+//! (`XT_PORT_ESP32S3` / `XT_PORT_ESP32`; single-threaded:
 //! `-- --test-threads=1`).
 
 use lp_xt_emu::emu::RunOutcome as EmuOutcome;
@@ -28,7 +29,7 @@ use xt_mini_emit::{
     emit_program, emit_program_with, AluImmOp, AluOp, CallInc, Callee, EmitOut, MiniFunc,
     MiniProgram, MiniVInst, PReg,
 };
-use xt_runner_client::{RunOutcome as HwOutcome, Runner};
+use xt_testkit::Harness;
 
 use MiniVInst::{
     AluRRI, AluRRR, BrIf, CallMulti, IConst32, IncomingStackArg, Label, Load32, Ret, RetMulti,
@@ -44,53 +45,21 @@ fn func(slots: Vec<u32>, insts: Vec<MiniVInst>) -> MiniFunc {
 }
 
 // ---------------------------------------------------------------------------
-// Harness (device() pattern shared with tests/dual_run.rs)
+// Harness (shared: xt-testkit N-runs each case on every profile + board)
 // ---------------------------------------------------------------------------
 
-fn emu_run(code: &[u8], entry_offset: u32, arg: u32) -> EmuOutcome {
-    let mut emu = Emulator::new();
-    emu.run(code, entry_offset, arg)
-}
-
-fn device() -> Option<Runner> {
-    match Runner::from_env() {
-        None => {
-            eprintln!("XT_DEVICE_PORT unset — emulator-only (no hardware conformance)");
-            None
-        }
-        Some(Ok(r)) => Some(r),
-        Some(Err(e)) => panic!("failed to open device: {e}"),
-    }
-}
-
-fn dual_run(
-    device: &mut Option<Runner>,
-    seq: &mut u32,
-    name: &str,
-    out: &EmitOut,
-    arg: u32,
-    expect: u32,
-) {
+fn dual_run(h: &mut Harness, name: &str, out: &EmitOut, arg: u32, expect: u32) {
     assert!(
         out.sym_slots.is_empty(),
         "[{name}] dual-run programs must be position-independent (no sym slots)"
     );
-    match emu_run(&out.code, out.entry_offset, arg) {
-        EmuOutcome::Ok(got) => {
-            assert_eq!(got, expect, "[{name}] emu result mismatch (arg={arg})")
-        }
-        other => panic!("[{name}] emu outcome {other:?}, expected Ok({expect}) (arg={arg})"),
-    }
+    h.nrun(name, &out.code, out.entry_offset, arg, expect);
+}
 
-    let Some(dev) = device.as_mut() else { return };
-    *seq += 1;
-    let hw = dev
-        .load_exec(*seq, out.code.clone(), out.entry_offset, arg)
-        .unwrap_or_else(|e| panic!("[{name}] device load_exec failed: {e}"));
-    match hw {
-        HwOutcome::Ok(h) => assert_eq!(h, expect, "[{name}] EMU vs HW diff (arg={arg})"),
-        HwOutcome::Crash(r) => panic!("[{name}] device crashed (arg={arg}): {r:?}"),
-    }
+/// Emulator-only run on the default (S3) profile, for emu-level tests.
+fn emu_run(code: &[u8], entry_offset: u32, arg: u32) -> EmuOutcome {
+    let mut emu = Emulator::new();
+    emu.run(code, entry_offset, arg)
 }
 
 // ---------------------------------------------------------------------------
@@ -618,23 +587,22 @@ fn deep_expect(d: u32) -> u32 {
 
 #[test]
 fn p4_corpus_dual_run() {
-    let mut dev = device();
-    let mut seq = 7000u32;
+    let mut h = Harness::from_env(7000);
     let args = [0u32, 1, 7, 42, 1000, 0xFFFF_FFFB, 0x8000_0000];
 
     let many8 = emit_program(&prog_many8());
     for a in args {
-        dual_run(&mut dev, &mut seq, "p4-many8", &many8, a, many8_expect(a));
+        dual_run(&mut h, "p4-many8", &many8, a, many8_expect(a));
     }
 
     let ret2 = emit_program(&prog_ret2());
     for a in args {
-        dual_run(&mut dev, &mut seq, "p4-ret2", &ret2, a, ret2_expect(a));
+        dual_run(&mut h, "p4-ret2", &ret2, a, ret2_expect(a));
     }
 
     let sret4 = emit_program(&prog_sret4());
     for a in args {
-        dual_run(&mut dev, &mut seq, "p4-sret4", &sret4, a, sret4_expect(a));
+        dual_run(&mut h, "p4-sret4", &sret4, a, sret4_expect(a));
     }
 
     // Depths straddling the measured window-overflow onset (first spill at
@@ -642,12 +610,12 @@ fn p4_corpus_dual_run() {
     // sret buffers stay correct while ancestor frames spill/reload.
     let deep = emit_program(&prog_deep());
     for d in [0u32, 1, 3, 5, 6, 7, 8, 12, 17, 30] {
-        dual_run(&mut dev, &mut seq, "p4-deep", &deep, d, deep_expect(d));
+        dual_run(&mut h, "p4-deep", &deep, d, deep_expect(d));
     }
 
     eprintln!(
-        "p4_corpus_dual_run: all cases passed (device={})",
-        dev.is_some()
+        "p4_corpus_dual_run: all cases passed (boards={})",
+        h.boards.len()
     );
 }
 

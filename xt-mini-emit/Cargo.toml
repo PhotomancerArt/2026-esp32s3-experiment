@@ -16,3 +16,4 @@ lp-xt-inst = { path = "../lp-xt-inst" }
 lp-xt-emu = { path = "../lp-xt-emu" }
 xt-runner-client = { path = "../xt-runner-client" }
 xt-runner-proto = { path = "../xt-runner-proto" }
+xt-testkit = { path = "../xt-testkit" }

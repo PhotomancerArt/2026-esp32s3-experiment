@@ -1,23 +1,21 @@
-//! Conformance corpus + dual-run harness.
+//! Conformance corpus, N-run (P5).
 //!
-//! Every case runs on `lp-xt-emu`. When `XT_DEVICE_PORT` is set, each
-//! position-independent case *also* runs on the ESP32-S3 via `xt-runner-client`
-//! and the two outcomes are asserted equal (result value, and crash
-//! classification on faults). Without a device the emulator still checks each
-//! case against its known answer.
+//! Every case runs on `lp-xt-emu` under **every** board profile (S3 and
+//! classic memory maps) against its known answer. Each attached board —
+//! `XT_PORT_ESP32S3` (alias `XT_DEVICE_PORT`) and/or `XT_PORT_ESP32` — also
+//! runs every position-independent case, and value/crash-class must agree
+//! across all worlds (`xt-testkit` is the shared harness).
 //!
-//! Hardware tests share ONE board — run single-threaded:
-//!   XT_DEVICE_PORT=/dev/cu.usbmodem1101 cargo test -p lp-xt-emu -- --test-threads=1 --nocapture
+//! Hardware tests share the boards — run single-threaded:
+//!   XT_PORT_ESP32S3=... XT_PORT_ESP32=... cargo test -p lp-xt-emu -- --test-threads=1 --nocapture
 //!
 //! All payload bytes are objdump-derived (see the scratch `.s` sources and
 //! FINDINGS.md), never hand-recalled.
 
-use lp_xt_emu::emu::{CODE_DBUS_BASE, RunOutcome as EmuOutcome};
-use lp_xt_emu::memory::Memory;
+use lp_xt_emu::emu::RunOutcome as EmuOutcome;
 use lp_xt_emu::{Emulator, TrapKind};
 
-use xt_runner_client::{RunOutcome as HwOutcome, Runner};
-use xt_runner_proto::CrashKind;
+use xt_testkit::{known_profiles, Expect, Harness};
 
 // ---------------------------------------------------------------------------
 // Corpus (all bytes assembler-derived; entry at offset 0 unless noted).
@@ -83,91 +81,12 @@ const RECB_BLOB: &[u8] = &[
 ];
 
 // ---------------------------------------------------------------------------
-// Harness
+// Harness (shared: xt-testkit N-runs each case on every profile + board)
 // ---------------------------------------------------------------------------
-
-/// Expected known answer for a case.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Expect {
-    Ok(u32),
-    Crash(TrapKind),
-}
-
-fn emu_run(code: &[u8], entry_offset: u32, arg: u32) -> EmuOutcome {
-    let mut emu = Emulator::new();
-    emu.run(code, entry_offset, arg)
-}
-
-/// Assert the emulator matches `expect`, and — when a device is present — that
-/// the hardware agrees with the emulator (value and crash class).
-fn dual_run(
-    device: &mut Option<Runner>,
-    seq: u32,
-    name: &str,
-    code: &[u8],
-    entry_offset: u32,
-    arg: u32,
-    expect: Expect,
-) {
-    let emu = emu_run(code, entry_offset, arg);
-
-    // 1) Emulator vs known answer.
-    match (expect, emu) {
-        (Expect::Ok(v), EmuOutcome::Ok(g)) => {
-            assert_eq!(g, v, "[{name}] emu result mismatch (arg={arg})");
-        }
-        (Expect::Crash(k), EmuOutcome::Trap(t)) => {
-            assert_eq!(t.kind, k, "[{name}] emu trap kind mismatch: {t:?}");
-        }
-        (exp, got) => panic!("[{name}] emu outcome {got:?} != expected {exp:?} (arg={arg})"),
-    }
-
-    // 2) Emulator vs hardware (position-independent cases only).
-    let Some(dev) = device.as_mut() else {
-        return;
-    };
-    let hw = dev
-        .load_exec(seq, code.to_vec(), entry_offset, arg)
-        .unwrap_or_else(|e| panic!("[{name}] device load_exec failed: {e}"));
-    match (emu, hw) {
-        (EmuOutcome::Ok(e), HwOutcome::Ok(h)) => {
-            assert_eq!(e, h, "[{name}] EMU vs HW result diff (arg={arg})");
-        }
-        (EmuOutcome::Trap(t), HwOutcome::Crash(r)) => {
-            let hw_kind = match r.kind {
-                CrashKind::Timeout => TrapKind::Timeout,
-                _ => TrapKind::Exception,
-            };
-            assert_eq!(
-                t.kind, hw_kind,
-                "[{name}] EMU vs HW crash-class diff: emu={:?} hw={:?}",
-                t, r
-            );
-            eprintln!("[{name}] crash agree: emu={t:?} hw={r:?}");
-        }
-        (e, h) => panic!("[{name}] EMU vs HW outcome diff: emu={e:?} hw={h:?} (arg={arg})"),
-    }
-}
-
-fn device() -> Option<Runner> {
-    match Runner::from_env() {
-        None => {
-            eprintln!("XT_DEVICE_PORT unset — emulator-only (no hardware conformance)");
-            None
-        }
-        Some(Ok(r)) => Some(r),
-        Some(Err(e)) => panic!("failed to open device: {e}"),
-    }
-}
 
 /// Patch a little-endian u32 into `code` at `off`.
 fn patch_u32(code: &mut [u8], off: usize, val: u32) {
     code[off..off + 4].copy_from_slice(&val.to_le_bytes());
-}
-
-/// I-bus entry address the emulator will place `code` at.
-fn emu_entry(entry_offset: u32) -> u32 {
-    Memory::ibus_alias(CODE_DBUS_BASE).wrapping_add(entry_offset)
 }
 
 // ---------------------------------------------------------------------------
@@ -177,62 +96,76 @@ fn emu_entry(entry_offset: u32) -> u32 {
 
 #[test]
 fn corpus_dual_run() {
-    let mut dev = device();
-    let mut seq = 1u32;
-    let mut next = || {
-        seq += 1;
-        seq
-    };
+    let mut h = Harness::from_env(1);
 
     // --- basic value-returning cases (dual-run capable) ---
-    dual_run(&mut dev, next(), "stub42", STUB42, 0, 0, Expect::Ok(42));
-    dual_run(&mut dev, next(), "stub42-argignored", STUB42, 0, 999, Expect::Ok(42));
-    dual_run(&mut dev, next(), "identity", IDENTITY, 0, 1234, Expect::Ok(1234));
-    dual_run(&mut dev, next(), "identity-0", IDENTITY, 0, 0, Expect::Ok(0));
+    h.nrun_expect("stub42", STUB42, 0, 0, Expect::Ok(42));
+    h.nrun_expect("stub42-argignored", STUB42, 0, 999, Expect::Ok(42));
+    h.nrun_expect("identity", IDENTITY, 0, 1234, Expect::Ok(1234));
+    h.nrun_expect("identity-0", IDENTITY, 0, 0, Expect::Ok(0));
 
     // arithmetic: f(a) = 3a + 13
     for a in [0u32, 1, 7, 1000] {
-        dual_run(&mut dev, next(), "arith", ARITH, 0, a, Expect::Ok(3 * a + 13));
+        h.nrun_expect("arith", ARITH, 0, a, Expect::Ok(3 * a + 13));
     }
 
     // load/store round-trip: f(a) = a + 100
     for a in [0u32, 5, 42, 100000] {
-        dual_run(&mut dev, next(), "loadstore", LOADSTORE, 0, a, Expect::Ok(a + 100));
+        h.nrun_expect("loadstore", LOADSTORE, 0, a, Expect::Ok(a + 100));
     }
 
     // branches both directions: f(a) = if a>=10 {2} else {1}
-    dual_run(&mut dev, next(), "branch-nottaken", BRANCHDIR, 0, 5, Expect::Ok(1));
-    dual_run(&mut dev, next(), "branch-taken", BRANCHDIR, 0, 20, Expect::Ok(2));
-    dual_run(&mut dev, next(), "branch-edge", BRANCHDIR, 0, 10, Expect::Ok(2));
+    h.nrun_expect("branch-nottaken", BRANCHDIR, 0, 5, Expect::Ok(1));
+    h.nrun_expect("branch-taken", BRANCHDIR, 0, 20, Expect::Ok(2));
+    h.nrun_expect("branch-edge", BRANCHDIR, 0, 10, Expect::Ok(2));
 
     // backward-branch loop: f(a) = a*(a+1)/2
     for a in [0u32, 1, 10, 50] {
-        dual_run(&mut dev, next(), "sumloop", SUMLOOP, 0, a, Expect::Ok(a * (a + 1) / 2));
+        h.nrun_expect("sumloop", SUMLOOP, 0, a, Expect::Ok(a * (a + 1) / 2));
     }
 
     // --- window-pressure: deep recursion forcing overflow/underflow ---
     // call8 wraps the 64-reg file every 8 frames; depth 30/100 forces many
     // spill/reload round-trips — the key window-machinery check. f(d) = d.
     for d in [1u32, 7, 8, 9, 16, 17, 30, 100] {
-        dual_run(&mut dev, next(), "rec8", REC8, 0, d, Expect::Ok(d));
+        h.nrun_expect("rec8", REC8, 0, d, Expect::Ok(d));
     }
     // call12 (inc=3) recursion — a different rotation width. f(d) = d.
     for d in [1u32, 5, 16, 30, 60] {
-        dual_run(&mut dev, next(), "rec12", REC12, 0, d, Expect::Ok(d));
+        h.nrun_expect("rec12", REC12, 0, d, Expect::Ok(d));
     }
 
     // --- fault cases (crash classification must agree) ---
-    dual_run(&mut dev, next(), "crash-ill", CRASH_ILL, 0, 0, Expect::Crash(TrapKind::Exception));
-    dual_run(&mut dev, next(), "hang", HANG, 0, 0, Expect::Crash(TrapKind::Timeout));
+    h.nrun_expect("crash-ill", CRASH_ILL, 0, 0, Expect::Crash(TrapKind::Exception));
+    h.nrun_expect("hang", HANG, 0, 0, Expect::Crash(TrapKind::Timeout));
 
-    eprintln!("corpus_dual_run: all cases passed (device={})", dev.is_some());
+    eprintln!(
+        "corpus_dual_run: all cases passed (boards={})",
+        h.boards.len()
+    );
 }
 
 // ---------------------------------------------------------------------------
 // Emulator-only golden vectors that self-address via callx8 + l32r (absolute
 // literals), so they cannot be position-independently run on the device. These
-// exercise the callx8 + l32r-literal + builtin-call paths.
+// exercise the callx8 + l32r-literal + builtin-call paths — linked and run per
+// board profile (the absolute addresses come from each profile's
+// `code_ibus_base()`, never a hardcoded map).
 // ---------------------------------------------------------------------------
+
+/// Run a self-addressing blob on the emulator under `profile`, with `link`
+/// patching the absolute literals for that profile's I-bus code base.
+fn emu_run_linked(
+    profile: lp_xt_emu::BoardProfile,
+    code: &mut [u8],
+    entry_offset: u32,
+    arg: u32,
+    link: impl Fn(&mut [u8], u32),
+) -> EmuOutcome {
+    link(code, profile.code_ibus_base());
+    let mut emu = Emulator::with_profile(profile);
+    emu.run(code, entry_offset, arg)
+}
 
 #[test]
 fn gv2_callx8_builtin() {
@@ -244,23 +177,32 @@ fn gv2_callx8_builtin() {
     }
     let mul3_off = code.len() as u32;
     code.extend_from_slice(MUL3);
-    patch_u32(&mut code, 0, emu_entry(mul3_off));
 
-    match emu_run(&code, 4, 0) {
-        EmuOutcome::Ok(v) => assert_eq!(v, 126, "GV2 callx8 builtin(42) = 3*42"),
-        other => panic!("GV2 unexpected: {other:?}"),
+    for (chip, profile) in known_profiles() {
+        let mut blob = code.clone();
+        let got = emu_run_linked(profile, &mut blob, 4, 0, |c, base| {
+            patch_u32(c, 0, base + mul3_off);
+        });
+        match got {
+            EmuOutcome::Ok(v) => assert_eq!(v, 126, "GV2 [{chip}] callx8 builtin(42) = 3*42"),
+            other => panic!("GV2 [{chip}] unexpected: {other:?}"),
+        }
     }
 }
 
 #[test]
 fn gv3a_callx8_recursion() {
     // Self literal at +0 → entry (+4). f(d) = d, via callx8 recursion.
-    for d in [0u32, 1, 8, 17, 30, 100] {
-        let mut code = REC_BLOB.to_vec();
-        patch_u32(&mut code, 0, emu_entry(4));
-        match emu_run(&code, 4, d) {
-            EmuOutcome::Ok(v) => assert_eq!(v, d, "GV3a f({d}) = {d}"),
-            other => panic!("GV3a d={d} unexpected: {other:?}"),
+    for (chip, profile) in known_profiles() {
+        for d in [0u32, 1, 8, 17, 30, 100] {
+            let mut code = REC_BLOB.to_vec();
+            let got = emu_run_linked(profile, &mut code, 4, d, |c, base| {
+                patch_u32(c, 0, base + 4);
+            });
+            match got {
+                EmuOutcome::Ok(v) => assert_eq!(v, d, "GV3a [{chip}] f({d}) = {d}"),
+                other => panic!("GV3a [{chip}] d={d} unexpected: {other:?}"),
+            }
         }
     }
 }
@@ -269,18 +211,24 @@ fn gv3a_callx8_recursion() {
 fn gv3b_recursion_with_builtin_base() {
     // Self +0 → entry (+8); builtin +4 → mul3. Base case does builtin(7)=21,
     // each level adds 1: f(d) = d + 21.
-    for d in [0u32, 1, 8, 17, 30, 100] {
-        let mut code = RECB_BLOB.to_vec();
-        while !code.len().is_multiple_of(4) {
-            code.push(0);
-        }
-        let mul3_off = code.len() as u32;
-        code.extend_from_slice(MUL3);
-        patch_u32(&mut code, 0, emu_entry(8)); // self
-        patch_u32(&mut code, 4, emu_entry(mul3_off)); // builtin
-        match emu_run(&code, 8, d) {
-            EmuOutcome::Ok(v) => assert_eq!(v, d + 21, "GV3b f({d}) = {d}+21"),
-            other => panic!("GV3b d={d} unexpected: {other:?}"),
+    let mut blob = RECB_BLOB.to_vec();
+    while !blob.len().is_multiple_of(4) {
+        blob.push(0);
+    }
+    let mul3_off = blob.len() as u32;
+    blob.extend_from_slice(MUL3);
+
+    for (chip, profile) in known_profiles() {
+        for d in [0u32, 1, 8, 17, 30, 100] {
+            let mut code = blob.clone();
+            let got = emu_run_linked(profile, &mut code, 8, d, |c, base| {
+                patch_u32(c, 0, base + 8); // self
+                patch_u32(c, 4, base + mul3_off); // builtin
+            });
+            match got {
+                EmuOutcome::Ok(v) => assert_eq!(v, d + 21, "GV3b [{chip}] f({d}) = {d}+21"),
+                other => panic!("GV3b [{chip}] d={d} unexpected: {other:?}"),
+            }
         }
     }
 }

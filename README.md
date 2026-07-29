@@ -14,8 +14,9 @@ per-crate READMEs); the seam into the monorepo is [docs/BACKPORT.md](docs/BACKPO
 | `lp-xt-inst` | Xtensa encode / decode / disasm | objdiff: 10,969/10,969 instructions match objdump |
 | `lp-xt-emu` | Pure-Rust emulator + windowed-register machinery | matches hardware through depth-100 window recursion |
 | `lp-xt-elf` | Linked-ELF loader + guest runtime | 14 Rust fixtures run on the emulator |
-| `xt-mini-emit` | MiniVInst → Xtensa emitter (pools, branches, frames) | 60-case corpus agrees emu-vs-silicon |
-| `xt-runner` (+client/proto) | On-device payload runner — send code over USB, no reflash | crash + hang recovery, the hardware oracle |
+| `xt-mini-emit` | MiniVInst → Xtensa emitter (pools, branches, frames) | 60-case corpus agrees emu-vs-silicon on both chips |
+| `xt-runner` (+core/client/proto) | On-device payload runner — send code over serial, no reflash | crash + hang recovery on S3 (USB-CDC) and classic ESP32 (UART), the hardware oracle |
+| `xt-testkit` | Shared N-run harness: emulator on every board profile + every attached board | one code path serves LX7 and LX6 |
 
 The two hardest risks of the whole project — the windowed ABI and the espup toolchain —
 are retired.
@@ -71,6 +72,26 @@ cd fw/spike && cargo run --release   # builds, flashes, opens the monitor
 
 Every experiment prints machine-checkable lines: `En: PASS key=value ...`,
 `En: FAIL reason=...`, `En: MEASURE key=value`.
+
+## Testing
+
+Host tests are **N-run** (P5): the emulator runs every case on every board's
+memory profile, and every attached board runs it too, through one code path
+(`xt-testkit`). Boardless `cargo test --workspace` is always green; boards join
+via per-board env vars, **verified against the device's reported chip id**
+(port numbers are not stable across replug):
+
+```bash
+cargo test --workspace                                       # emulator-only
+XT_PORT_ESP32S3=/dev/cu.usbmodemXXXX \
+XT_PORT_ESP32=/dev/cu.usbserial-XXXX \
+  cargo test --workspace -- --test-threads=1                 # + real silicon
+```
+
+Single-threaded with hardware — a board is a shared resource. An unset var
+skips that board; a configured-but-unreachable board **fails** (silent skips
+hide regressions). Board-specific expectations (capacity contracts, transport
+quirks) live in `xt-testkit/tests/board_esp32s3.rs` / `board_esp32.rs`.
 
 ## Status
 

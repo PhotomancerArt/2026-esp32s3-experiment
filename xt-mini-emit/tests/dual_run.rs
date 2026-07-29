@@ -1,25 +1,25 @@
-//! Dual-run exit rig for the MiniVInst emitter (M5).
+//! N-run exit rig for the MiniVInst emitter (M5, N-run since P5).
 //!
-//! Every emitted program runs on `lp-xt-emu` against a Rust-computed known
-//! answer. When `XT_DEVICE_PORT` is set, each position-independent program
-//! *also* runs on the real ESP32-S3 via `xt-runner-client` and the outcomes
-//! must agree — the hardware oracle catches any bug the emulator and emitter
-//! might share.
+//! Every emitted program runs on `lp-xt-emu` under every board profile
+//! against a Rust-computed known answer. Every attached board
+//! (`XT_PORT_ESP32S3` / `XT_PORT_ESP32`; `XT_DEVICE_PORT` = S3 alias) also
+//! runs each position-independent program via `xt-runner-client` and all
+//! outcomes must agree — the hardware oracle catches any bug the emulator and
+//! emitter might share.
 //!
-//! Hardware tests share ONE board — run single-threaded:
-//!   XT_DEVICE_PORT=/dev/cu.usbmodem1101 cargo test -p xt-mini-emit -- --test-threads=1 --nocapture
+//! Hardware tests share the boards — run single-threaded:
+//!   XT_PORT_ESP32S3=... XT_PORT_ESP32=... cargo test -p xt-mini-emit -- --test-threads=1 --nocapture
 //! (All device cases live in the single `corpus_dual_run` test; the other
 //! tests are emulator-only.)
 
-use lp_xt_emu::emu::{RunOutcome as EmuOutcome, CODE_DBUS_BASE};
-use lp_xt_emu::memory::Memory;
+use lp_xt_emu::emu::RunOutcome as EmuOutcome;
 use lp_xt_emu::Emulator;
 
 use xt_mini_emit::{
     emit_program, AluImmOp, AluOp, Callee, EmitOut, IcmpCond, MiniFunc, MiniProgram, MiniVInst,
     PReg,
 };
-use xt_runner_client::{RunOutcome as HwOutcome, Runner};
+use xt_testkit::{known_profiles, Harness};
 
 use MiniVInst::{
     AluRRI, AluRRR, Br, BrIf, Call, FuelCheck, IConst32, Icmp, IcmpImm, Label, Load32, Ret, Select,
@@ -41,54 +41,16 @@ fn prog1(insts: Vec<MiniVInst>) -> MiniProgram {
 }
 
 // ---------------------------------------------------------------------------
-// Harness (pattern shared with lp-xt-emu/tests/conformance.rs)
+// Harness (shared: xt-testkit N-runs each case on every profile + board)
 // ---------------------------------------------------------------------------
 
-fn emu_run(code: &[u8], entry_offset: u32, arg: u32) -> EmuOutcome {
-    let mut emu = Emulator::new();
-    emu.run(code, entry_offset, arg)
-}
-
-fn device() -> Option<Runner> {
-    match Runner::from_env() {
-        None => {
-            eprintln!("XT_DEVICE_PORT unset — emulator-only (no hardware conformance)");
-            None
-        }
-        Some(Ok(r)) => Some(r),
-        Some(Err(e)) => panic!("failed to open device: {e}"),
-    }
-}
-
-/// Emulator vs known answer, then (with a device) emulator vs hardware.
-fn dual_run(
-    device: &mut Option<Runner>,
-    seq: &mut u32,
-    name: &str,
-    out: &EmitOut,
-    arg: u32,
-    expect: u32,
-) {
+/// Every world (emu per profile + each board) vs the known answer.
+fn dual_run(h: &mut Harness, name: &str, out: &EmitOut, arg: u32, expect: u32) {
     assert!(
         out.sym_slots.is_empty(),
         "[{name}] dual-run programs must be position-independent (no sym slots)"
     );
-    match emu_run(&out.code, out.entry_offset, arg) {
-        EmuOutcome::Ok(got) => {
-            assert_eq!(got, expect, "[{name}] emu result mismatch (arg={arg})")
-        }
-        other => panic!("[{name}] emu outcome {other:?}, expected Ok({expect}) (arg={arg})"),
-    }
-
-    let Some(dev) = device.as_mut() else { return };
-    *seq += 1;
-    let hw = dev
-        .load_exec(*seq, out.code.clone(), out.entry_offset, arg)
-        .unwrap_or_else(|e| panic!("[{name}] device load_exec failed: {e}"));
-    match hw {
-        HwOutcome::Ok(h) => assert_eq!(h, expect, "[{name}] EMU vs HW diff (arg={arg})"),
-        HwOutcome::Crash(r) => panic!("[{name}] device crashed (arg={arg}): {r:?}"),
-    }
+    h.nrun(name, &out.code, out.entry_offset, arg, expect);
 }
 
 // ---------------------------------------------------------------------------
@@ -720,49 +682,46 @@ fn link_syms(out: &EmitOut, base: u32) -> Vec<u8> {
 
 #[test]
 fn corpus_dual_run() {
-    let mut dev = device();
-    let mut seq = 1000u32;
+    let mut h = Harness::from_env(1000);
     let args = [0u32, 1, 7, 10, 42, 1000, 0xFFFF_FFFB, 0x8000_0000];
 
     let arith = emit_program(&prog_arith());
     for a in args {
         let expect = a.wrapping_add(5).wrapping_mul(3).wrapping_sub(2);
-        dual_run(&mut dev, &mut seq, "arith", &arith, a, expect);
+        dual_run(&mut h, "arith", &arith, a, expect);
     }
 
     let bigconst = emit_program(&prog_bigconst());
     for a in args {
         let expect = a.wrapping_add(0x1234_5678) ^ 0x0F0F_0F0F;
-        dual_run(&mut dev, &mut seq, "bigconst", &bigconst, a, expect);
+        dual_run(&mut h, "bigconst", &bigconst, a, expect);
     }
 
     let opsmix = emit_program(&prog_opsmix());
     for a in args {
-        dual_run(&mut dev, &mut seq, "opsmix", &opsmix, a, opsmix_expect(a));
+        dual_run(&mut h, "opsmix", &opsmix, a, opsmix_expect(a));
     }
 
     let sumloop = emit_program(&prog_sumloop());
     for a in [0u32, 1, 10, 50] {
-        dual_run(&mut dev, &mut seq, "sumloop", &sumloop, a, a * (a + 1) / 2);
+        dual_run(&mut h, "sumloop", &sumloop, a, a * (a + 1) / 2);
     }
 
     let branchdir = emit_program(&prog_branchdir());
     for (a, expect) in [(5u32, 1u32), (20, 2), (10, 2), (0xFFFF_FFFB, 1)] {
-        dual_run(&mut dev, &mut seq, "branchdir", &branchdir, a, expect);
+        dual_run(&mut h, "branchdir", &branchdir, a, expect);
     }
 
     let select_max = emit_program(&prog_select_max());
     for a in args {
         let expect = (a as i32).max(100) as u32;
-        dual_run(&mut dev, &mut seq, "select-max", &select_max, a, expect);
+        dual_run(&mut h, "select-max", &select_max, a, expect);
     }
 
     let icmp = emit_program(&prog_icmp_matrix());
     for a in [0u32, 9, 10, 11, 0xFFFF_FFFB, 0x8000_0000] {
         dual_run(
-            &mut dev,
-            &mut seq,
-            "icmp-matrix",
+            &mut h, "icmp-matrix",
             &icmp,
             a,
             icmp_matrix_expect(a),
@@ -771,40 +730,38 @@ fn corpus_dual_run() {
 
     let slots = emit_program(&prog_slots());
     for a in args {
-        dual_run(&mut dev, &mut seq, "slots", &slots, a, slots_expect(a));
+        dual_run(&mut h, "slots", &slots, a, slots_expect(a));
     }
 
     let call_local = emit_program(&prog_call_local());
     for a in [0u32, 1, 41, 1000] {
         let expect = a.wrapping_add(1).wrapping_mul(3).wrapping_add(a);
-        dual_run(&mut dev, &mut seq, "call-local", &call_local, a, expect);
+        dual_run(&mut h, "call-local", &call_local, a, expect);
     }
 
     // Deep recursion: > 16 frames wraps the 64-register file repeatedly,
     // forcing WindowOverflow/Underflow spills through our emitted frames.
     let rec = emit_program(&prog_recursion());
     for d in [0u32, 1, 7, 8, 9, 16, 17, 30, 100] {
-        dual_run(&mut dev, &mut seq, "recursion", &rec, d, d);
+        dual_run(&mut h, "recursion", &rec, d, d);
     }
 
     // Same depths with a live stack slot in every frame: proves slots stay
     // clear of the window save areas across spill/reload.
     let rec_slots = emit_program(&prog_recursion_slots());
     for d in [0u32, 1, 8, 17, 30, 100] {
-        dual_run(&mut dev, &mut seq, "recursion-slots", &rec_slots, d, d);
+        dual_run(&mut h, "recursion-slots", &rec_slots, d, d);
     }
 
     let fuel = emit_program(&prog_fuel());
     for f in [0u32, 1, 5, 37] {
-        dual_run(&mut dev, &mut seq, "fuel", &fuel, f, f);
+        dual_run(&mut h, "fuel", &fuel, f, f);
     }
 
     let longbranch = emit_program(&prog_longbranch());
-    dual_run(&mut dev, &mut seq, "longbranch-taken", &longbranch, 1, 0);
+    dual_run(&mut h, "longbranch-taken", &longbranch, 1, 0);
     dual_run(
-        &mut dev,
-        &mut seq,
-        "longbranch-fallthrough",
+        &mut h, "longbranch-fallthrough",
         &longbranch,
         0,
         900,
@@ -815,20 +772,24 @@ fn corpus_dual_run() {
     // and the runner loads payloads at heap-chosen addresses that aren't fixed
     // (FINDINGS.md GV3). Device-side calls are already covered by the
     // PC-relative `call-local` case above (CALL8, position-independent). The
-    // sym-slot linking mechanism is exercised here and in `callx8_sym_builtin_emu`.
+    // sym-slot linking mechanism is exercised here and in `callx8_sym_builtin_emu`,
+    // linked per board profile against that profile's I-bus code base.
     let sym = emit_program(&prog_call_sym());
-    let emu_code = link_syms(&sym, Memory::ibus_alias(CODE_DBUS_BASE));
-    for a in [0u32, 1, 14, 1000] {
-        let expect = a.wrapping_mul(3).wrapping_add(1);
-        match emu_run(&emu_code, sym.entry_offset, a) {
-            EmuOutcome::Ok(v) => assert_eq!(v, expect, "[call-sym] emu f({a})"),
-            other => panic!("[call-sym] emu a={a} unexpected: {other:?}"),
+    for (chip, profile) in known_profiles() {
+        let emu_code = link_syms(&sym, profile.code_ibus_base());
+        for a in [0u32, 1, 14, 1000] {
+            let expect = a.wrapping_mul(3).wrapping_add(1);
+            let mut emu = Emulator::with_profile(profile);
+            match emu.run(&emu_code, sym.entry_offset, a) {
+                EmuOutcome::Ok(v) => assert_eq!(v, expect, "[call-sym] emu:{chip} f({a})"),
+                other => panic!("[call-sym] emu:{chip} a={a} unexpected: {other:?}"),
+            }
         }
     }
 
     eprintln!(
-        "corpus_dual_run: all cases passed (device={})",
-        dev.is_some()
+        "corpus_dual_run: all cases passed (boards={})",
+        h.boards.len()
     );
 }
 
@@ -841,11 +802,14 @@ fn corpus_dual_run() {
 fn callx8_sym_builtin_emu() {
     let out = emit_program(&prog_call_sym());
     assert_eq!(out.sym_slots.len(), 1);
-    let code = link_syms(&out, Memory::ibus_alias(CODE_DBUS_BASE));
-    for a in [0u32, 1, 14, 1000] {
-        match emu_run(&code, out.entry_offset, a) {
-            EmuOutcome::Ok(v) => assert_eq!(v, 3 * a + 1, "callx8 f({a})"),
-            other => panic!("callx8 a={a} unexpected: {other:?}"),
+    for (chip, profile) in known_profiles() {
+        let code = link_syms(&out, profile.code_ibus_base());
+        for a in [0u32, 1, 14, 1000] {
+            let mut emu = Emulator::with_profile(profile);
+            match emu.run(&code, out.entry_offset, a) {
+                EmuOutcome::Ok(v) => assert_eq!(v, 3 * a + 1, "callx8 [{chip}] f({a})"),
+                other => panic!("callx8 [{chip}] a={a} unexpected: {other:?}"),
+            }
         }
     }
 }

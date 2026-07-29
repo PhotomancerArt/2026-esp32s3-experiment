@@ -1,0 +1,23 @@
+# NOTE: reachable from the root workspace as a path dev-dependency of
+# lp-xt-emu and xt-mini-emit (path deps inside the workspace directory are
+# automatic members); listing it explicitly in the root members is preferred.
+[package]
+name = "xt-testkit"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared N-run test harness: emulator on every board profile + every attached board, one code path."
+
+[lints]
+workspace = true
+
+[dependencies]
+lp-xt-emu = { path = "../lp-xt-emu" }
+xt-runner-client = { path = "../xt-runner-client" }
+xt-runner-proto = { path = "../xt-runner-proto", features = ["std"] }
+
+[dev-dependencies]
+# Board-specific tests build their probe payloads through the encoder
+# (never hand-encoded bytes).
+lp-xt-inst = { path = "../lp-xt-inst" }
