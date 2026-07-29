@@ -31,6 +31,38 @@ New findings worth carrying:
   coverage is sufficient for integer code. (objdump FPU-scanning is unreliable: literal
   pools at the head of `.text` disassemble as FPU garbage; the runtime trap is the gate.)
 
+## Compiler-contract phase — additional hardware findings
+
+Built on the standalone core: the register model + calling convention the real backend
+must satisfy. Full write-up in [docs/BACKPORT.md](docs/BACKPORT.md) and ADR
+`docs/adr/2026-07-28-xtensa-abi-contract.md`.
+
+- **The windowed ABI is invisible to register allocation** — the existing lpvm-native
+  allocator can be *configured* for Xtensa, not rewritten. The only structural change
+  the monorepo needs is an ISA hook in `abi/frame.rs` for reserved top-of-frame bytes
+  (32) where the window save areas live.
+- **Register pressure is near parity with rv32**: pool of 12 vs rv32's 13, and measured
+  in practice (live sets of 12 compile with zero spill slots). The rotation makes
+  argument staging a separate bank, so a2–a7 are call-preserved temporaries preserved
+  *for free* — rv32 pays prologue save/restore for its equivalent.
+- **CALL8 chosen on measured data**: preserved a2..a7 (rule `a_j` survives iff
+  `j < 4*inc`), 6 register args, first spill at depth 6. CALL12 is disqualified by a
+  2-register-arg ceiling (3-arg calls cannot be emitted); CALL4 by only 2 survivors plus
+  a staging/program-register overlap.
+- **No spill-slot vs window-save-area collision exists** — 68 dual-run cases across slot
+  counts, depths to 100, frame padding, and all three increments, with address-level
+  intersection checks. This was the worst silent-corruption risk in the design.
+- **Two L32R decode bugs found and fixed**: the 16-bit field is *one-extended*, not
+  sign-extended. The emitter's assert refused half the legal range, and the emulator's
+  executor mis-executed the far half (turning backward offsets into forward ones).
+- **`lp_xt_inst::encode` silently truncates** out-of-range immediates, which is why the
+  per-opcode legality table (`xt-mini-emit/src/imm.rs`) must gate every immediate. Also
+  pinned: Xtensa has no `ANDI`/`ORI`/`XORI`.
+- **Divide-by-zero now traps in the emulator** (EXCCAUSE 6), matching hardware on kind
+  and cause for all four division ops. `INT_MIN / -1` does *not* trap — it wraps, on both.
+- Argument/return convention **matches the esp toolchain exactly** (verified by
+  disassembling a real compiled fixture), so no invented convention to defend later.
+
 ## Headline conclusions for the Xtensa roadmap
 
 1. **The S3 JIT memory model is benign**: heap buffer → write via D-bus → execute at
