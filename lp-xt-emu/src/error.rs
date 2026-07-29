@@ -28,3 +28,8 @@ pub struct Trap {
 pub const EXC_ILLEGAL_INSTRUCTION: u32 = 0;
 /// EXCCAUSE for a `SYSCALL` with no host handler installed (`SyscallCause`).
 pub const EXC_SYSCALL: u32 = 1;
+/// EXCCAUSE for an integer divide (or remainder) by zero
+/// (`IntegerDivideByZeroCause`). Hardware raises this from `quos`/`quou`/
+/// `rems`/`remu` with a zero divisor; the P3 dual-run corpus asserts the
+/// emulator and the ESP32-S3 agree on this exact cause code.
+pub const EXC_INTEGER_DIVIDE_BY_ZERO: u32 = 6;

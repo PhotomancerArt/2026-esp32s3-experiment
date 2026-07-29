@@ -3,7 +3,7 @@
 use lp_xt_inst::{AluRrr, AluRs, AluRt, Inst, ShiftSetOp};
 
 use crate::emu::{Emulator, Flow};
-use crate::error::Trap;
+use crate::error::{Trap, TrapKind, EXC_INTEGER_DIVIDE_BY_ZERO};
 use crate::trace::Tracer;
 
 impl Emulator {
@@ -16,6 +16,23 @@ impl Emulator {
             Inst::Rrr(op, rd, rs, rt) => {
                 let s = self.rreg(rs.num());
                 let t = self.rreg(rt.num());
+                // Divide/remainder by zero raises IntegerDivideByZero on the
+                // hardware (EXCCAUSE 6) — model it as the same trap, not a
+                // value (dual-run parity pinned by the P3 corpus). The run
+                // loop fills in the faulting pc.
+                if t == 0
+                    && matches!(
+                        op,
+                        AluRrr::Quou | AluRrr::Quos | AluRrr::Remu | AluRrr::Rems
+                    )
+                {
+                    return Err(Trap {
+                        kind: TrapKind::Exception,
+                        cause: EXC_INTEGER_DIVIDE_BY_ZERO,
+                        pc: 0,
+                        vaddr: 0,
+                    });
+                }
                 let d = self.rreg(rd.num());
                 let v = alu_rrr(op, s, t, d, self.cpu.sar);
                 self.wreg(rd.num(), v, tracer);
@@ -111,34 +128,13 @@ fn alu_rrr(op: AluRrr, s: u32, t: u32, d: u32, sar: u32) -> u32 {
         AluRrr::Mull => s.wrapping_mul(t),
         AluRrr::Muluh => (((s as u64) * (t as u64)) >> 32) as u32,
         AluRrr::Mulsh => ((((s as i32 as i64) * (t as i32 as i64)) >> 32) as i32) as u32,
-        AluRrr::Quou => {
-            if t == 0 {
-                0
-            } else {
-                s / t
-            }
-        }
-        AluRrr::Quos => {
-            if t == 0 {
-                0
-            } else {
-                ((s as i32).wrapping_div(t as i32)) as u32
-            }
-        }
-        AluRrr::Remu => {
-            if t == 0 {
-                0
-            } else {
-                s % t
-            }
-        }
-        AluRrr::Rems => {
-            if t == 0 {
-                0
-            } else {
-                ((s as i32).wrapping_rem(t as i32)) as u32
-            }
-        }
+        // Zero divisors trap in `exec_arith` before reaching here (the
+        // IntegerDivideByZero model); `t != 0` is an invariant of these arms.
+        // `wrapping_div`/`wrapping_rem` give INT_MIN / -1 = INT_MIN, rem 0.
+        AluRrr::Quou => s / t,
+        AluRrr::Quos => ((s as i32).wrapping_div(t as i32)) as u32,
+        AluRrr::Remu => s % t,
+        AluRrr::Rems => ((s as i32).wrapping_rem(t as i32)) as u32,
         AluRrr::Min => (s as i32).min(t as i32) as u32,
         AluRrr::Max => (s as i32).max(t as i32) as u32,
         AluRrr::Minu => s.min(t),
