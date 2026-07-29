@@ -17,7 +17,7 @@ New findings worth carrying:
   call-stack shadow). See ADR `docs/adr/2026-07-28-emu-window-overflow-direct.md`.
 - **The runner's payload load address depends on the total request-frame length**,
   not just payload length — the firmware allocates a frame-sized scratch `Vec` before
-  the JIT buffer (`fw/xt-runner/src/main.rs`), so a one-byte-longer postcard `arg`
+  the JIT buffer (now `fw/xt-runner-esp32s3`), so a one-byte-longer postcard `arg`
   varint moves the buffer. Absolute-address `CALLX8` on device is therefore fragile
   (a runtime-base-discovery probe works with frame-length parity but is emulator-only
   in the corpus); PC-relative `CALL8` is the robust device-proven call path.

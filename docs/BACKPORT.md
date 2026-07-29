@@ -222,6 +222,53 @@ divergences (P5), and every immediate boundary agrees between the LX6 and LX7
 assemblers with byte-identical encodings (P6, live test
 `xt-mini-emit/tests/imm_gas_lx6.rs`; FINDINGS.md, "LX6 conformance").
 
+## Multi-board: classic ESP32 (LX6) is a first-class target
+
+**The deployed-hardware wedge is the classic ESP32, not the S3.** Both are now
+supported and hardware-verified here; the S3 remains the convenient bring-up board.
+The monorepo should inherit three shapes from this:
+
+**1. Board is a parameter in three places, not an assumption.** This repo learned that
+the hard way — "the board" was implicitly an S3 in the firmware, the emulator, and the
+test harness:
+- **Firmware**: `xt-runner-core` (no_std, board-agnostic: ledger, COBS/postcard
+  dispatch, payload flow, watchdog policy) + per-SOC crates supplying only `Transport`,
+  `CodeMem`, `PayloadWatchdog`. Reinforces the already-recorded "one fw crate per SOC
+  family" decision. See `docs/adr/2026-07-28-runner-board-abstraction.md`.
+- **Emulator**: `lp-xt-emu`'s memory map is a `BoardProfile`, not constants — **the
+  monorepo's emulator needs the same**, because dual-run against an LX6 device with an
+  S3 memory map silently compares the wrong addresses.
+- **Harness**: N-run (emulator per profile + every attached board) through one code
+  path, with boards **verified by the chip id they report**. Ports renumber across
+  replug — the S3 moved `usbmodem1101 → 1301` mid-session when a third board appeared —
+  so trusting an env var alone tests the wrong silicon.
+
+**2. The classic code-execution model — the S3's `+0x6F0000` alias does NOT generalize.**
+Measured (5 sentinels; the linear hypothesis read garbage at all five):
+
+| Region | Write | Rule | Usable |
+|---|---|---|---|
+| SRAM1 (primary) | D-bus, any width | **word-mirrored**: `iram = 0x400BFFFC − (dram − 0x3FFE0000)` | ~96 KB |
+| SRAM0 | its own I-bus address | identity, **32-bit aligned words only** | ~125 KB |
+| RTC-fast | D-bus `0x3FF80000+` | 1:1 (`+0xC40000`) | 8 KB |
+| heap (SRAM2) | — | **not executable** — no I-bus view | — |
+
+Consequences for `lpvm-native`'s `rt_jit`: the write/exec pointer split must be a
+**rule**, not an offset (`AliasRule::{Offset, Identity, WordMirrored}` is the shape that
+worked), the code buffer may be a **fixed region** rather than heap-backed (so
+"too large" is a real error path), and writes may need to be word-only with a
+non-monotonic address walk. A trait shaped as "buffer pointer + constant alias" models
+the S3 perfectly and is unimplementable on the actual target chip.
+
+**3. LX6 vs LX7: the ISA is identical; only the memory system differs.** Verified, not
+assumed — LX7-assembled golden vectors run byte-for-byte on LX6; a 171-case
+dual-assembler sweep over every immediate-table boundary found zero encoding or verdict
+differences; and the full emitter corpus passed on LX6 silicon with zero divergences.
+**Crucially, classic ESP32 HAS hardware division** (`quos/quou/rems/remu`, div-by-zero
+→ EXCCAUSE 6, `INT_MIN/−1` wraps) — the roadmap's biggest suspected divergence is
+retired, so **one emitter and one ABI serve both chips**. Emitting the LX6-common subset
+(wide forms; no LX7-only instructions) costs nothing and keeps it that way.
+
 ## What is NOT proven here (carry as monorepo risk)
 
 - FPU executors (fixtures + emitter are integer-only; lightplayer's device path is
@@ -241,3 +288,10 @@ assemblers with byte-identical encodings (P6, live test
 - The MOVSP large-frame escape path (frames > 32752 bytes hard-error today).
 - Real LPIR lowering, real `VInst`, and real register allocation — this repo proves the
   *contract*, not the integration.
+- **Classic ESP32 under load**: RAM headroom with WiFi up (measured heap here is ~97KB
+  bare-metal on a 192KB DRAM part, vs the S3's ~204KB), WS2812/RMT driving, and any
+  perf/CCOUNT numbers. Classic is the tighter part — size the JIT arena against it, not
+  the S3.
+- **A third chip** is admitted by the design (board = parameter everywhere) but not
+  exercised; the ESP32-C6 in the same drawer is RISC-V and belongs to the existing rv32
+  backend, not this one.

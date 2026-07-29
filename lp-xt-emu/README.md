@@ -129,9 +129,11 @@ XT_DEVICE_PORT=/dev/cu.usbmodem1101 \
   cargo test -p lp-xt-emu -- --test-threads=1 --nocapture      # dual-run vs hardware
 ```
 
-Hardware tests **must** run single-threaded (`--test-threads=1`) — there is one
-board, shared. Flash the runner first (`cd ../fw/xt-runner && cargo run
---release`).
+Hardware tests **must** run single-threaded (`--test-threads=1`) — a board is a
+shared resource. Flash the matching runner first (`cd ../fw/xt-runner-esp32s3`
+or `../fw/xt-runner-esp32`, then `cargo run --release`). Tests are N-run via
+`xt-testkit`: the emulator runs every case on **every** `BoardProfile`, and each
+attached board (per-board env vars, chip-id verified) runs it too.
 
 Corpus: golden vectors GV1–GV3b plus a generated set — arithmetic, load/store
 round-trips, branches both directions, a backward-branch loop, `call8` and

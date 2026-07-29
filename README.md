@@ -2,7 +2,13 @@
 
 A hardware-validated **standalone Xtensa core** for [lightplayer](https://github.com/light-player)'s
 Xtensa backend — plus the feasibility spike that started it. Can lightplayer's
-JIT-compiled LED shaders run on ESP32-S3? Yes: proven end-to-end here, against real silicon.
+JIT-compiled LED shaders run on Xtensa? Yes: proven end-to-end against real silicon
+on **both** target chips — **ESP32-S3 (LX7)** and **classic ESP32 (LX6)**, the latter
+being what most deployed WLED-class hardware actually runs.
+
+Everything is **N-run**: the emulator executes every case on every board's memory
+profile, and every attached board runs it too, through one code path. The LX6
+conformance sweep found **zero ISA divergences** from LX7 — one emitter serves both.
 
 ## The core (built here, backport-ready)
 
@@ -20,6 +26,18 @@ per-crate READMEs); the seam into the monorepo is [docs/BACKPORT.md](docs/BACKPO
 
 The two hardest risks of the whole project — the windowed ABI and the espup toolchain —
 are retired.
+
+## Boards
+
+| Board | ISA | Transport | Code memory | Env var |
+|---|---|---|---|---|
+| ESP32-S3 rev v0.2 | LX7 | USB-Serial-JTAG | heap; execute at the `+0x6F0000` I-bus alias | `XT_PORT_ESP32S3` |
+| classic ESP32 v3 | LX6 | USB-UART bridge @115200 | fixed SRAM1 region, **word-mirrored** `iram = 0x400BFFFC − (dram − 0x3FFE0000)`; the heap is *not* executable | `XT_PORT_ESP32` |
+
+The two chips differ **only in the memory system** — the executed instruction set is
+identical (LX7 golden vectors run byte-for-byte on LX6, and a 171-case dual-assembler
+sweep found no encoding differences). Port numbers renumber across replug, so boards are
+**verified by the chip id they report**, never by port name.
 
 ## The spike (how it started)
 

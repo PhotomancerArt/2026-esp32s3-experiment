@@ -39,7 +39,7 @@ atomics (`s32c1i`/`s32ri`/`l32ai`), boolean (`xorb`/`andb`), windowed spill
 cargo test -p lp-xt-inst
 # Differential disassembler conformance rig over the spike ELF:
 cargo run -p lp-xt-inst --features objdiff --bin objdiff -- \
-    fw/spike/target/xtensa-esp32s3-none-elf/release/spike
+    fw/spike-esp32s3/target/xtensa-esp32s3-none-elf/release/spike-esp32s3
 ```
 
 The `objdiff` rig disassembles the entire `.text` of an ELF with this crate and
