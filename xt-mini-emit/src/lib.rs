@@ -22,6 +22,7 @@
 extern crate alloc;
 
 pub mod emit;
+pub mod imm;
 pub mod vinst;
 
 pub use emit::{emit_program, EmitOut};
