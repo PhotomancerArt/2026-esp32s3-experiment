@@ -213,6 +213,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
+name = "portable-atomic"
+version = "1.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d20d5497ef88037a52ff98267d066e7f11fcc5e99bbfbd58a42336193aacec3"
+
+[[package]]
 name = "postcard"
 version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -464,6 +470,14 @@ dependencies = [
  "postcard",
  "serialport",
  "thiserror",
+ "xt-runner-proto",
+]
+
+[[package]]
+name = "xt-runner-core"
+version = "0.1.0"
+dependencies = [
+ "portable-atomic",
  "xt-runner-proto",
 ]
 

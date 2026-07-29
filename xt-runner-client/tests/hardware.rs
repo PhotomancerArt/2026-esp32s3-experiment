@@ -1,7 +1,7 @@
 //! Hardware integration tests for xt-runner. Gated on `XT_DEVICE_PORT` — when
 //! unset (no board), every test is skipped so `cargo test` stays green on CI.
 //!
-//! Flash the runner first: `cd fw/xt-runner && cargo run --release` (or espflash),
+//! Flash the runner first: `cd fw/xt-runner-esp32s3 && cargo run --release` (or espflash),
 //! then: `XT_DEVICE_PORT=/dev/cu.usbmodem1101 cargo test -p xt-runner-client -- --nocapture`
 //!
 //! Payload bytes are objdump-derived (see the scratch payloads.s), never hand-recalled.

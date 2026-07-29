@@ -1381,15 +1381,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "xt-runner"
+name = "xt-runner-core"
+version = "0.1.0"
+dependencies = [
+ "portable-atomic",
+ "xt-runner-proto",
+]
+
+[[package]]
+name = "xt-runner-esp32s3"
 version = "0.1.0"
 dependencies = [
  "critical-section",
  "esp-alloc",
  "esp-bootloader-esp-idf",
  "esp-hal",
- "nb 1.1.0",
- "portable-atomic",
+ "xt-runner-core",
  "xt-runner-proto",
 ]
 

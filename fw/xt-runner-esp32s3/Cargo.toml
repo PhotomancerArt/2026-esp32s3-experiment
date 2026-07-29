@@ -1,12 +1,12 @@
 [package]
-name = "xt-runner"
+name = "xt-runner-esp32s3"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.86"
 
 [[bin]]
-name = "xt-runner"
+name = "xt-runner-esp32s3"
 path = "src/main.rs"
 
 [dependencies]
@@ -15,8 +15,7 @@ esp-hal = { version = "1.1.1", features = ["esp32s3", "log-04", "unstable"] }
 
 critical-section = "1.2.0"
 esp-alloc = { version = "0.10.0", features = ["internal-heap-stats"] }
-nb = "1"
-portable-atomic = { version = "1", default-features = false }
+xt-runner-core = { path = "../../xt-runner-core" }
 xt-runner-proto = { path = "../../xt-runner-proto" }
 
 [profile.dev]

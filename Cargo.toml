@@ -13,6 +13,7 @@ members = [
     "lp-xt-emu",
     "lp-xt-elf",
     "xt-mini-emit",
+    "xt-runner-core",
 ]
 exclude = ["fw", "oss", "fixtures"]
 

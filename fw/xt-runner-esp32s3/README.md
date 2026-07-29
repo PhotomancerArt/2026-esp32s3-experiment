@@ -1,4 +1,4 @@
-# xt-runner
+# xt-runner-esp32s3
 
 Resident ESP32-S3 firmware that executes Xtensa machine-code payloads sent over
 USB-Serial-JTAG — **without reflashing**. It is the *hardware oracle* for the
@@ -6,7 +6,18 @@ standalone Xtensa core: the emulator (`lp-xt-emu`) and emitter (`xt-mini-emit`)
 diff their results against a real chip via this runner.
 
 Pairs with [`xt-runner-client`](../../xt-runner-client) (host) and
-[`xt-runner-proto`](../../xt-runner-proto) (shared wire types).
+[`xt-runner-proto`](../../xt-runner-proto) (shared wire types). The
+board-agnostic logic — crash ledger, protocol dispatch, payload flow, watchdog
+policy — lives in [`xt-runner-core`](../../xt-runner-core); this crate supplies
+the S3-specific pieces:
+
+- **Transport**: USB-Serial-JTAG (`src/board.rs`).
+- **Code memory**: a heap buffer executed through SRAM1's uniform `+0x6F_0000`
+  I-bus alias (`src/jitbuf.rs` — on the S3, "the heap is executable").
+- **Watchdog**: the RWDT with a `ResetCore` stage action (RTC RAM — and thus
+  the crash ledger — survives a hang reset).
+- **Ledger storage + panic handler**: the persistent RTC-fast statics and the
+  EXCCAUSE/EPC1/EXCVADDR-reading panic handler (`src/main.rs`).
 
 ## Protocol
 
@@ -42,9 +53,9 @@ arms the RWDT watchdog. Then:
 ## Build / flash
 
 ```bash
-cd fw/xt-runner
+cd fw/xt-runner-esp32s3
 cargo run --release          # builds, flashes, (no monitor — binary channel)
-# or: espflash flash --chip esp32s3 --port <port> target/xtensa-esp32s3-none-elf/release/xt-runner
+# or: espflash flash --chip esp32s3 --port <port> target/xtensa-esp32s3-none-elf/release/xt-runner-esp32s3
 ```
 
 Requires the Espressif `esp` Rust toolchain (see repo README). Xtensa asm needs
@@ -54,4 +65,5 @@ Requires the Espressif `esp` Rust toolchain (see repo README). Xtensa asm needs
 
 Original code. No derivation from third-party sources. The JitBuf SRAM1-alias
 technique and the RTC-ledger pattern come from this repo's own feasibility spike
-(see `FINDINGS.md`). See `docs/adr/2026-07-28-license-provenance-discipline.md`.
+(see `FINDINGS.md`); the shared logic was extracted to `xt-runner-core` in the
+multi-board phase. See `docs/adr/2026-07-28-license-provenance-discipline.md`.

@@ -1,0 +1,15 @@
+[package]
+name = "xt-runner-core"
+version = "0.1.0"
+# Explicit (not workspace-inherited) so the crate also resolves as a path
+# dependency from the excluded fw/ crates; values match [workspace.package].
+edition = "2021"
+license = "MIT"
+rust-version = "1.86"
+
+[dependencies]
+portable-atomic = { version = "1", default-features = false }
+xt-runner-proto = { path = "../xt-runner-proto" }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
