@@ -84,6 +84,13 @@ above).
    16 for `a4..a7` spills under call8) + stack slots growing from `a1+0`, rounded to
    16. `entry`'s immediate caps at 32760 bytes; larger frames need the `movsp` path
    (not needed here — asserted).
+6. **Call increment: CALL8 by default**, now a parameter (`CallInc`,
+   `emit_program_with`) so the same program can be emitted under CALL4/8/12.
+   The choice is measurement-backed — preserved-register / register-arg /
+   window-overflow tradeoffs on emulator and silicon, including CALL12's 2-arg
+   ceiling and CALL4's arg-staging hazard: see
+   [docs/call-inc-study.md](docs/call-inc-study.md) (P1 study;
+   `tests/call_inc_study.rs` is the rig).
 
 ## Icmp branch table
 

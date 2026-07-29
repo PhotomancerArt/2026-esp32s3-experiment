@@ -25,7 +25,7 @@ pub mod emit;
 pub mod imm;
 pub mod vinst;
 
-pub use emit::{emit_program, EmitOut};
+pub use emit::{emit_program, emit_program_with, CallInc, EmitOut};
 pub use vinst::{
     AluImmOp, AluOp, Callee, IcmpCond, LabelId, MiniFunc, MiniProgram, MiniVInst, PReg, SymbolId,
 };

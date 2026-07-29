@@ -29,15 +29,18 @@
 //!
 //! - We are a windowed callee: one `ENTRY a1, frame` prologue, `RETW`
 //!   epilogue. Our argument arrives in `a2`; our result is returned in `a2`.
-//! - `a0`/`a1` are return-address/SP. Program registers are `a2..=a7` — all
-//!   preserved across our own `CALL8`/`CALLX8`s by the window rotation.
-//! - `a8`/`a9` are emitter scratch; `a10..=a15` stage outgoing call
-//!   arguments (the callee sees them as `a2..=a7`). A call's result comes
-//!   back in our `a10`.
-//! - Frame: `ENTRY` needs a 16-byte base save area at the frame top, plus 16
-//!   more for `a4..a7` spills since we are reached via call8 — the top
-//!   [`SAVE_AREA_BYTES`] of the frame are reserved and stack slots grow from
-//!   `a1 + 0` upward.
+//! - `a0`/`a1` are return-address/SP. Program registers are `a2..=a7`.
+//! - `a8`/`a9` are emitter scratch.
+//! - The **call increment** ([`CallInc`], default `CALL8`) picks the rest:
+//!   which program registers survive our own calls, where outgoing arguments
+//!   are staged (callee `a2..` = caller `a[4*inc]+2..`), and where a call's
+//!   result comes back (caller `a[4*inc + 2]`). Under `CALL8` that is the
+//!   M5 layout: `a2..=a7` all survive, args stage at `a10..=a15`, result in
+//!   `a10`. See `docs/call-inc-study.md` for the measured tradeoff.
+//! - Frame: `ENTRY` needs a 16-byte base save area at the frame top, plus
+//!   16 bytes per additional window unit for the `a4..` spills written by
+//!   `_WindowOverflow{8,12}` — the top [`CallInc::save_area_bytes`] of the
+//!   frame are reserved and stack slots grow from `a1 + 0` upward.
 
 extern crate alloc;
 
@@ -45,8 +48,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use lp_xt_inst::{
-    encode, AluRrr, AluRs, AluRt, BrRr, BrZ, CallxOp, Inst, LoadOp, NullaryNarrowOp, NullaryOp,
-    Reg, ShiftSetOp, StoreOp,
+    encode, AluRrr, AluRs, AluRt, BrRr, BrZ, CallOp, CallxOp, Inst, LoadOp, NullaryNarrowOp,
+    NullaryOp, Reg, ShiftSetOp, StoreOp,
 };
 
 use crate::vinst::{
@@ -56,13 +59,101 @@ use crate::vinst::{
 /// Emitter scratch registers (never available to MiniVInst programs).
 const SCRATCH0: Reg = Reg::new(8);
 const SCRATCH1: Reg = Reg::new(9);
-/// First outgoing-argument register for windowed calls (callee's `a2`).
-const ARG_BASE: u8 = 10;
-/// Reserved bytes at the top of every frame: 16-byte base save area (our
-/// a0..a3) + 16 bytes for our a4..a7, spilled by `_WindowOverflow8` when we
-/// are reached via call8. Hardware-proven by the spike's `entry a1, 32`
-/// recursion (FINDINGS E4).
-const SAVE_AREA_BYTES: u32 = 32;
+
+/// The windowed call increment the emitter uses for every call it produces.
+///
+/// `CALLn` stages the return address in the caller's `a[n]` and the callee's
+/// `ENTRY` rotates the window so callee `a0` = caller `a[n]`. The choice
+/// fixes, for the caller:
+///
+/// - **preserved registers**: caller `a2..a[n-1]` survive the call (they sit
+///   below the callee's window);
+/// - **argument staging**: callee arguments always arrive in its `a2..=a7`,
+///   i.e. caller `a[n+2]..a[n+7]` — but the caller can only write inside its
+///   own 16-register window, so `CALL12` can stage just 2 register args
+///   (`a14`,`a15`);
+/// - **overflow pressure**: each live frame owns `n/4` base-units of the
+///   64-register file, so smaller increments fit more frames before the
+///   window-overflow traps start spilling.
+///
+/// Measured tradeoff (emulator + ESP32-S3): `docs/call-inc-study.md`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum CallInc {
+    /// `CALL4`: 2 preserved program registers, 6 register args, ~cheapest
+    /// window pressure.
+    Call4,
+    /// `CALL8`: 6 preserved program registers, 6 register args. The default
+    /// (the hardware-proven M5 layout).
+    #[default]
+    Call8,
+    /// `CALL12`: 10 preserved registers, but only **2** register args.
+    Call12,
+}
+
+impl CallInc {
+    /// Window rotation in 4-register base units (the value of `PS.CALLINC`).
+    pub const fn units(self) -> u8 {
+        match self {
+            CallInc::Call4 => 1,
+            CallInc::Call8 => 2,
+            CallInc::Call12 => 3,
+        }
+    }
+
+    /// Caller register that maps to the callee's `a2` (first argument out,
+    /// and where the callee's return value lands).
+    pub const fn arg_base(self) -> u8 {
+        4 * self.units() + 2
+    }
+
+    /// Register-argument capacity: the callee reads args from its `a2..=a7`,
+    /// but the caller can only stage into its own window (`a15` max), so
+    /// capacity = `min(6, 16 - arg_base)` — 6 for CALL4/CALL8, **2** for
+    /// CALL12.
+    pub const fn max_reg_args(self) -> usize {
+        let cap = (16 - self.arg_base()) as usize;
+        if cap > 6 {
+            6
+        } else {
+            cap
+        }
+    }
+
+    /// Reserved bytes at the top of every frame for window-trap spills.
+    ///
+    /// A frame entered with increment `u` units needs the 16-byte base save
+    /// area plus `16 * (u - 1)` bytes for the `a4..` registers spilled by
+    /// `_WindowOverflow{8,12}` — i.e. `16 * u`. The entry function is always
+    /// reached via the runner's CALL8 (`u = 2`) regardless of the internal
+    /// policy, so the reservation is floored at 32 bytes; `CALL12` raises it
+    /// to 48. (Hardware-minimal would be per-function — 16 bytes for a
+    /// CALL4-only callee — but the uniform reservation is safe under both
+    /// the hardware handlers and lp-xt-emu's save-area model, and frame size
+    /// does not affect window-overflow onset.)
+    pub const fn save_area_bytes(self) -> u32 {
+        let u = self.units();
+        let u = if u < 2 { 2 } else { u };
+        16 * u as u32
+    }
+
+    /// PC-relative call opcode for this increment.
+    pub const fn call_op(self) -> CallOp {
+        match self {
+            CallInc::Call4 => CallOp::Call4,
+            CallInc::Call8 => CallOp::Call8,
+            CallInc::Call12 => CallOp::Call12,
+        }
+    }
+
+    /// Register-indirect call opcode for this increment.
+    pub const fn callx_op(self) -> CallxOp {
+        match self {
+            CallInc::Call4 => CallxOp::Callx4,
+            CallInc::Call8 => CallxOp::Callx8,
+            CallInc::Call12 => CallxOp::Callx12,
+        }
+    }
+}
 
 /// `beqz`/`bnez` (BRI12) taken-target range: `PC + 4 + imm12`, imm12 signed.
 const BRI12_MIN: i64 = -2048;
@@ -87,15 +178,27 @@ pub struct EmitOut {
     pub sym_slots: Vec<(SymbolId, u32)>,
 }
 
-/// Emit `prog` into a single self-contained buffer.
+/// Emit `prog` into a single self-contained buffer with the default
+/// [`CallInc::Call8`] policy.
 ///
 /// Panics on malformed input (registers outside `a2..=a7`, unknown labels,
-/// more than 6 call args, immediate fields out of their documented ranges) —
-/// these are compiler-invariant violations, mirroring the real emit stage
-/// where they are unreachable by construction.
+/// more call args than the increment supports, immediate fields out of their
+/// documented ranges) — these are compiler-invariant violations, mirroring
+/// the real emit stage where they are unreachable by construction.
 pub fn emit_program(prog: &MiniProgram) -> EmitOut {
+    emit_program_with(prog, CallInc::default())
+}
+
+/// As [`emit_program`], with an explicit call-increment policy. The same
+/// MiniVInst program can be emitted under CALL4/CALL8/CALL12 for comparison;
+/// a program whose calls carry more than [`CallInc::max_reg_args`] arguments
+/// cannot be emitted under that increment and panics.
+pub fn emit_program_with(prog: &MiniProgram, inc: CallInc) -> EmitOut {
     assert!(!prog.funcs.is_empty(), "program has no functions");
-    let mut e = Emitter::default();
+    let mut e = Emitter {
+        inc,
+        ..Emitter::default()
+    };
     for (i, f) in prog.funcs.iter().enumerate() {
         e.lower_func(i, f, prog.funcs.len());
     }
@@ -132,8 +235,9 @@ enum Item {
     Jump { label: GLabel },
     /// `l32r rt, <literal>`.
     L32r { rt: Reg, lit: usize },
-    /// `call8 <function entry>` (PC-relative, target 4-aligned).
-    Call8 { func: usize },
+    /// `call{4,8,12} <function entry>` (PC-relative, target 4-aligned; the
+    /// opcode comes from the emitter's [`CallInc`]).
+    CallFunc { func: usize },
     /// Function start: pad to 4-byte alignment (executable nops), record the
     /// entry offset.
     FuncStart(usize),
@@ -159,6 +263,8 @@ struct Emitter {
     items: Vec<Slot>,
     literals: Vec<Literal>,
     n_funcs: usize,
+    /// Call-increment policy for every call this emitter produces.
+    inc: CallInc,
 }
 
 impl Emitter {
@@ -262,7 +368,7 @@ impl Emitter {
             .last()
             .zip(f.slots.last())
             .map_or(0, |(&o, &s)| o + s.div_ceil(4) * 4);
-        let frame = (SAVE_AREA_BYTES + slots_bytes).div_ceil(16) * 16;
+        let frame = (self.inc.save_area_bytes() + slots_bytes).div_ceil(16) * 16;
         assert!(frame <= 32760, "frame too large for ENTRY immediate");
         self.inst(Inst::Entry(Reg::new(1), frame));
 
@@ -373,26 +479,49 @@ impl Emitter {
                 self.iconst(d, *val);
             }
             MiniVInst::Call { callee, args, ret } => {
-                assert!(args.len() <= 6, "at most 6 call args (a10..a15)");
-                // Stage args at a10+ (sources a2..a7 never alias dests).
+                let inc = self.inc;
+                assert!(
+                    args.len() <= inc.max_reg_args(),
+                    "at most {} register args under {inc:?} (got {})",
+                    inc.max_reg_args(),
+                    args.len()
+                );
+                // Stage args at the increment's staging area. Under CALL8/12
+                // the staging registers (a10+/a14+) never alias the a2..=a7
+                // sources; under CALL4 the area is a6..a11, so the a6/a7
+                // dests would clobber still-unread sources — bounce those two
+                // through a12/a13 (free: above the CALL4 staging area, below
+                // nothing live) and write them last.
+                let base = inc.arg_base();
+                let mut bounced: [Option<(u8, u8)>; 2] = [None; 2];
                 for (i, a) in args.iter().enumerate() {
                     let s = self.r(*a);
-                    self.mov(Reg::new(ARG_BASE + i as u8), s);
+                    let dest = base + i as u8;
+                    if dest <= 7 {
+                        let tmp = 12 + i as u8;
+                        self.mov(Reg::new(tmp), s);
+                        bounced[i] = Some((dest, tmp));
+                    } else {
+                        self.mov(Reg::new(dest), s);
+                    }
+                }
+                for (dest, tmp) in bounced.into_iter().flatten() {
+                    self.mov(Reg::new(dest), Reg::new(tmp));
                 }
                 match callee {
                     Callee::Func(f) => {
                         assert!(*f < self.n_funcs, "Call to unknown function {f}");
-                        self.push(Item::Call8 { func: *f });
+                        self.push(Item::CallFunc { func: *f });
                     }
                     Callee::Sym(sym) => {
                         let lit = self.lit(Literal::Sym(*sym));
                         self.push(Item::L32r { rt: SCRATCH0, lit });
-                        self.inst(Inst::Callx(CallxOp::Callx8, SCRATCH0));
+                        self.inst(Inst::Callx(inc.callx_op(), SCRATCH0));
                     }
                 }
                 if let Some(rr) = ret {
                     let d = self.r(*rr);
-                    self.mov(d, Reg::new(ARG_BASE));
+                    self.mov(d, Reg::new(base));
                 }
             }
             MiniVInst::Ret { val } => {
@@ -660,16 +789,13 @@ impl Emitter {
                     );
                     code.extend_from_slice(&encode(&Inst::L32r(*rt, imm as i16 as u16)));
                 }
-                Item::Call8 { func } => {
+                Item::CallFunc { func } => {
                     let target = labels.funcs[*func] as i64;
                     // target = (PC & !3) + (off << 2) + 4; both target and the
                     // rounded PC are 4-aligned, so the division is exact.
                     let off = (target - (pc & !3) - 4) >> 2;
-                    assert!((J_MIN..=J_MAX).contains(&off), "CALL8 offset out of range");
-                    code.extend_from_slice(&encode(&Inst::Call(
-                        lp_xt_inst::CallOp::Call8,
-                        off as i32,
-                    )));
+                    assert!((J_MIN..=J_MAX).contains(&off), "CALLn offset out of range");
+                    code.extend_from_slice(&encode(&Inst::Call(self.inc.call_op(), off as i32)));
                 }
             }
         }
@@ -723,7 +849,7 @@ fn item_size(item: &Item, off: u32, long: bool) -> u32 {
         Item::Bytes(b) => b.len() as u32,
         Item::LabelDef(_) => 0,
         Item::FuncStart(_) => align_pad(off),
-        Item::Jump { .. } | Item::L32r { .. } | Item::Call8 { .. } => 3,
+        Item::Jump { .. } | Item::L32r { .. } | Item::CallFunc { .. } => 3,
         Item::CondBr { .. } => {
             if long {
                 6
