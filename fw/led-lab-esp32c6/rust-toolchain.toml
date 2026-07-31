@@ -1,0 +1,12 @@
+# The ESP32-C6 is RISC-V, so this crate builds on plain upstream nightly — not
+# the Espressif `esp` channel the Xtensa crates under `fw/` need. The date is
+# pinned to the one lp2025's `lp-fw/fw-esp32` uses, so the two trees agree on
+# what "nightly" means when the backend is backported.
+#
+# Nightly (rather than stable) is required only for esp-hal's `#[esp_hal::main]`
+# entry and the unstable feature set; no `-Zbuild-std` here — `riscv32imac` ships
+# a precompiled `core`, so listing the target is enough.
+[toolchain]
+channel    = "nightly-2026-04-27"
+components = ["clippy", "rustfmt"]
+targets    = ["riscv32imac-unknown-none-elf"]

@@ -295,3 +295,197 @@ retired, so **one emitter and one ABI serve both chips**. Emitting the LX6-commo
 - **A third chip** is admitted by the design (board = parameter everywhere) but not
   exercised; the ESP32-C6 in the same drawer is RISC-V and belongs to the existing rv32
   backend, not this one.
+
+---
+
+# WS281x LED driver backport seam (`lp-ws281x` → lp2025)
+
+A second, unrelated body of work in this repo (see the root `README.md`'s
+"WS281x LED driver" section) that lp2025 is porting **now**, starting from
+the state this document describes: `lp-ws281x` ports into `lp-fw/` unmodified,
+and a new S3 backend crate implements lp2025's own existing
+`Ws281xDriver`/`Ws281xOutput` registry traits over it. This section is written
+so that porting agent can work from it without reading the rest of this repo.
+Everything here is validated on real ESP32-S3, classic ESP32 and ESP32-C6
+hardware — see `lp-ws281x/README.md`, the three `fw/led-lab-*/README.md`
+files, the ADR at `docs/adr/2026-07-31-ws281x-rmt-driver-architecture.md`, and
+`findings.md` in the plan directory
+(`2026-esp32s3-experiment/2026-07-28-ws281x-rmt-driver/findings.md` under the
+planning root) for the underlying evidence.
+
+## What replaces what
+
+**`lp-ws281x` replaces lp2025's `lp-fw/fw-esp32/src/output/rmt/` entirely** —
+it is that driver's direct descendant, generalized and cleaned up by the same
+author, not a new design. Port the crate itself unmodified (per lp2025's own
+plan notes: "no S3-isms," channel count comes from the board manifest, not a
+baked-in constant); the porting work is a **new backend crate** implementing
+`RmtHw` for the S3's registers (see below), plus a thin adapter implementing
+lp2025's `Ws281xDriver`/`Ws281xOutput` traits over an `lp_ws281x::Ws281xDriver`
+instance.
+
+**Naming collision to watch for**: lp2025's chip-agnostic seam
+(`lp-core/lpc-hardware/src/drivers/ws281x/ws281x_driver.rs`) defines a *trait*
+named `Ws281xDriver` (`endpoints`, `open`, supertrait `HwDriver`) plus
+`Ws281xOutput` (`write(&[u8])`, `resize`) and `Ws281xConfig` (just
+`byte_count`; pin comes from the endpoint address). `lp-ws281x` also exports a
+type named `Ws281xDriver` — but it is a **struct**
+(`Ws281xDriver<H: RmtHw, const N: usize>`, this crate's whole driver, holding
+one backend and N `ChannelState`s), not a trait. The two are not the same
+thing and the names will collide unqualified in the same module. The new S3
+backend crate's adapter implements lp2025's `Ws281xDriver` *trait* and
+`Ws281xOutput`, and internally owns (or references, if it is a `static` like
+every `fw/led-lab-*` crate here) an instance of `lp_ws281x::Ws281xDriver`.
+
+**What changed vs. the lp2025 original**, all load-bearing for the port:
+
+- **N channels, not one.** lp2025 hardcoded channel 0 in its ISR and kept
+  state in slot 0 only. `lp_ws281x::Ws281xDriver<H, N>` is const-generic over
+  channel count; `on_interrupt` services every flagged channel in one pass
+  (coincident causes are the steady state with several channels sharing one
+  block each, not a rare accident — see the trait doc comment on `RmtHw` and
+  the driver's `on_interrupt` doc).
+- **A bit cursor, not an LED counter.** lp2025 assumed a ping-pong half held a
+  whole number of LEDs (its 192-word window halved into exactly 4 LEDs). That
+  breaks the moment a channel owns one memory block instead of four — the
+  S3's 48-word block halves into 24 words = exactly one LED, which happens to
+  still be whole, but do not assume it stays whole if the block plan changes;
+  the classic ESP32's 64-word block halves into 32 words = 1⅓ LEDs, which is
+  not. The bit-cursor core makes every half size correct on every chip
+  without a special case.
+- **300 µs default latch, not 50 µs.** lp2025's 50 µs latch is too short for
+  modern WS2812B-V5 and WS2815 parts (WLED/NeoPixelBus's own timing tables —
+  consulted as behavioral reference only, see the ADR's license posture —
+  use 300 µs, and that is now this crate's `ChannelTiming::WS2812` default).
+  If the lp2025 board's strips are known-older parts that need the shorter
+  latch, override the timing per channel; do not silently reintroduce a
+  50 µs global default.
+- **Per-channel `ChannelTiming` + `ColorOrder`**, not hardcoded GRB. Configure
+  each channel independently via `Ws281xDriver::configure`/
+  `configure_default_clock`.
+- **`BlockPlan`, shared by the driver and the backend**, not an implicit
+  assumption. It decides which channels exist at all when one channel's
+  window is widened to absorb the blocks above it, and it is validated (an
+  overlapping plan is rejected, not silently wrong). The backend must be
+  built from the *same* `BlockPlan` value the driver uses — `RmtHw::ram_words`
+  remains the authority the driver trusts, but the backend's own RAM
+  addressing must agree with it.
+- **Warts fixed, all present in the lp2025 original and absent here**: the
+  start-of-frame guard race (lp2025 planted a guard at word 0 right after
+  `tx_start` and hoped the transmitter had already passed it); `static mut` +
+  `transmute('static)` + `AnyPin::steal` (every `fw/led-lab-*` crate here uses
+  a plain `static Ws281xDriver<Backend, N>` — `with_blocks`/`new` are `const`
+  and every field is atomic, so no unsafe registry trick is needed, provided
+  the new backend crate owns its pins for the program's lifetime the way a
+  firmware binary can and a dynamically-reconfigured registry may not); the
+  interrupt handler being re-registered on every channel construction (now
+  bound once, behind an `AtomicBool`, in `install_isr`); a
+  `Relaxed`-store/`Acquire`-load counter mismatch (see `state.rs`'s "Memory
+  ordering" module doc for the release/acquire pairing that replaces it).
+
+**`DisplayPipeline` stays exactly where it is.** The driver's scope is
+unchanged: it takes finished `u8` RGB frames and does no color processing —
+gamma, dithering, white-point, brightness all remain
+`lp-core/lpc-shared`'s job, upstream of the driver, exactly as lp2025's
+existing per-frame flow already has it (engine tick →
+`flush_dirty_output_sinks` → `Esp32OutputProvider` → `DisplayPipeline` →
+driver `write` with finished bytes). The new adapter's `Ws281xOutput::write`
+implementation is a thin wrapper over `Ws281xDriver::send_blocking` (or
+`send_blocking_all` if the registry starts multiple channels together) —
+nothing upstream of it changes.
+
+**Known single-channel leaks to clean up while integrating** (from lp2025's
+own code, not from this repo): `fw-esp32-common/src/output/rmt_state.rs`'s
+fixed `[ChannelState; 2]` with a comment noting "only [0] used" — a
+per-chip RMT concern that has been living in the *common* crate; expect to
+retire it, since `lp-ws281x` brings its own per-channel state. Also
+`provider.rs`'s `MAX_LEDS = 256` silent truncation (duplicated in the C6
+driver) and its hardcoded 60 fps double-push — neither blocks a 4-channel S3
+port, both are worth flagging as separate cleanup.
+
+## The `RmtHw` trait surface (7 methods)
+
+Everything chip-specific a backend supplies; read `lp-ws281x/src/hw.rs` for
+the authoritative doc comments (each method's contract below is a summary,
+not a replacement for reading the source — the trait file is ~150 lines).
+Every method takes `&self`: the driver is shared between thread context and
+the interrupt handler, so a backend's state is memory-mapped registers, not
+owned/mutable Rust data.
+
+| Method | Contract | The trap |
+|---|---|---|
+| `ram_words(&self, ch: u8) -> usize` | Words usable by `ch` (block size × blocks assigned). **Must be stable for the driver's lifetime, at least 4, and even** — the driver splits it into two equal ping-pong halves. | An odd or sub-4 value is a `ConfigError` at `configure()`, not a panic — but it means the `BlockPlan` handed to the backend and the one handed to the driver disagreed, which should never happen if both come from one shared value (see `BlockPlan` above). |
+| `write_ram(&self, ch: u8, word_idx: usize, value: u32)` | Volatile store of one RMT word into `ch`'s window, `word_idx` in `0..ram_words(ch)`. | None structural — but every backend here derives the physical address as `RAM_BASE + window_start(ch) + word_idx`, never from a per-channel base register, because none of the three chips have one. |
+| `set_tx_threshold(&self, ch: u8, words: u16)` | Set `ch`'s `tx_lim`-equivalent so the next threshold event fires at the `words`'th word of the window. | **Chip-semantics trap, not a core bug, hit once already**: on the classic ESP32, the hardware register is a *repeating count of words sent*, not a window position — writing it re-arms the count from zero. The driver's alternating half/full request, unchanged, asked that register for an event every 64 words instead of every 32, and every second refill arrived a whole half late. Fixed in that backend by clamping the request to the channel's half size; **verify which semantics the new chip's register has before assuming either one.** |
+| `read_pos(&self, ch: u8) -> u16` | Current hardware read pointer within `ch`'s window, **window-relative**, `0..ram_words(ch)`. | **The single biggest silent-porting trap in this trait.** The underlying register (`mem_raddr_ex` or equivalent) is an **absolute offset into the whole RMT RAM on all three chips measured so far** (S3: 10 bits into 384 words; classic: 10 bits into 512; C6: 9 bits into 192) — none of them are window-relative in hardware. Every existing backend computes `read_pos` as the raw register value **minus `window_start(ch)`**. lp2025's own C6 driver read the register raw and was *coincidentally correct*, because its one hardcoded channel's window starts at word 0 — that bug will not survive generalizing to a channel whose window does not start at 0, which is exactly what a 4-channel port does starting with channel 1. |
+| `start_tx(&self, ch: u8)` | Begin transmitting `ch` from word 0 — the whole start sequence (reset the read pointer, apply pending config). Called after RAM is filled and the threshold is set. | Chip-specific self-clearing/trigger-bit semantics vary; verify on silicon rather than assuming a `modify` vs `write` pattern from another chip's backend. |
+| `stop_tx(&self, ch: u8)` | Stop `ch` immediately. **Must tolerate being called on an already-idle channel** — `Ws281xDriver::abort` calls it unconditionally on every cleanup path, including ones where the channel never started. | A backend that assumes "stop" is only ever called on a running channel will misbehave on the abort-after-error and abort-after-unwind paths, which are exercised by `send_blocking`/`send_blocking_all`'s drop guards on every early return. |
+| `take_interrupts(&self) -> InterruptFlags` | Read **and clear** pending causes for all channels in one shot, so no cause is lost between the read and the acknowledgement. Returns per-channel `threshold`/`end`/`error` bitsets. | The **silent-porting trap with identical PAC accessor names across three genuinely different bit layouts**: the S3 groups `INT_*` by event-then-channel (`tx_end` bits 0..=3, `tx_thr_event` bits 8..=11, …); the C6 interleaves TX and RX with **2-bit** per-channel fields at shifts that coincide with the S3's by chance, so an S3-style `0b1111` group mask silently clears *receive* causes on the C6; the classic ESP32 interleaves *by channel* (`chN_tx_end` = bit `3N`, `chN_err` = `3N+2` as a **combined TX/RX** bit — there is no separate `tx_err`). A mask or shift copied from another chip's backend compiles and appears to work until a cause it silently drops actually fires. |
+
+## Per-chip register facts an S3 port needs (already settled, do not re-derive)
+
+- **RAM offset**: S3 `+0x800` (`RMT_BASE + 0x800`, e.g. `0x6001_6800`).
+  Classic ESP32 is also `+0x800` — numerically the same, coincidentally, not
+  because the layout is shared (different block size and channel count).
+  ESP32-C6 is `+0x400`, the odd one out. Getting this wrong does not fail to
+  build; the transmitter silently sends whatever RAM happens to be at the
+  wrong address. Every backend here proves its offset on silicon at boot with
+  a two-step probe (direct store/load, then a write pushed through the
+  peripheral's own FIFO port) — see any `fw/led-lab-*/src/*_rmt.rs`'s
+  `probe_ram_address`, worth porting as-is.
+- **`tx_thr_event` re-raise differs per chip, and it changes what
+  `guard_trips` means.** The S3 re-raises an unacknowledged threshold event: a
+  post-guard replacement refill can be serviced into the gap after the
+  transmitter has already latched the guard word, advancing the driver's bit
+  cursor by up to one half without anything reaching the wire. Consequence:
+  **on the S3, `guard_trips` is a lower bound** — a truncation in a frame's
+  very last half can go uncounted (never over-reported). The classic ESP32
+  and the C6 do **not** re-raise, so `guard_trips` is an **exact** count on
+  those two. Any telemetry or alerting built on this counter needs to know
+  which chip it is reading from.
+- **The classic ESP32's `CH_TX_LIM` is a repeating count, not a window
+  position** (see the `set_tx_threshold` row above) — the one place a
+  register semantics difference is not just a layout difference but a
+  different *meaning*, and it is a real bug already found and fixed once in
+  this repo's own classic backend (`fw/led-lab-esp32/src/esp32_rmt.rs`,
+  `set_tx_threshold`). If lp2025's classic port reimplements this from
+  scratch rather than porting the existing backend, re-read that function's
+  comments before assuming the S3's semantics generalize.
+
+## The capacity ceiling (`findings.md` §12) — constrains the 4-channel goal, but supports it
+
+P6's stress phase found the classic ESP32's RMT refill interrupt has a hard
+**throughput ceiling**, independent of WiFi load: delivered interrupt rate
+flatlines at **~46,000–55,000 refills/s** no matter how much is demanded. At
+the shipped `blocks_per_channel = 1` (32-word halves on that chip), a single
+continuously-transmitting channel demands `800,000 / 32` = 25,000 refills/s,
+so **two channels saturate the ceiling exactly** — which is why the classic
+sustains only two simultaneous *equal-length* outputs today, not four, and
+why that boundary is sharp rather than gradual (`findings.md` §12 has the
+full `irq_hz`-vs-demand measurement). This matters to lp2025's own roadmap
+(their notes: "esp32 v3" — the classic — is next after the S3), but it is a
+**classic-ESP32-specific** number, not a general RMT ceiling.
+
+**On the ESP32-S3 — lp2025's actual target for this port — the equivalent
+measurement supports the 4-channel goal directly.** At `blocks_per_channel = 1`
+(24-word halves, four channels, 300/256/200/150-LED strips, the same
+configuration a 4-channel port would use), a 600-second stress soak measured:
+
+| scenario | frames | truncated | lag_max/24 |
+|---|---|---|---|
+| idle | 220,568 | **0** | 9 |
+| WiFi scan loop | 216,792 | 2,248 (**1.04 %**) | 12 |
+| ESP-NOW broadcast | 74,692 | 2 (~0.003 %) | 10 |
+
+Zero errors, zero timeouts, in every scenario (`findings.md` §11.1; also
+summarized in `fw/led-lab-esp32s3/README.md`'s stress-harness section). **Say
+this explicitly to whoever is deciding whether four channels is achievable on
+the S3: it is, at idle and under ordinary radio use, by direct measurement,
+not projection.** The only degradation is under a continuous WiFi *scan*
+loop specifically (not steady-state association or ESP-NOW, which are close
+to free) — a much lighter finding than the classic ESP32's, where the same
+class of load truncates roughly two frames in three and is the subject of a
+separate high-priority-interrupt follow-up plan (see the ADR). Nothing about
+the S3 numbers blocks shipping four channels; the WiFi-scan number is a
+degrade-not-break case if this port ever wants to close it further, not a
+launch blocker.

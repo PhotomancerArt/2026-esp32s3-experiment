@@ -15,6 +15,7 @@ members = [
     "xt-mini-emit",
     "xt-runner-core",
     "xt-testkit",
+    "lp-ws281x",
 ]
 exclude = ["fw", "oss", "fixtures"]
 

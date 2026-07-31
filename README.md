@@ -39,6 +39,24 @@ identical (LX7 golden vectors run byte-for-byte on LX6, and a 171-case dual-asse
 sweep found no encoding differences). Port numbers renumber across replug, so boards are
 **verified by the chip id they report**, never by port name.
 
+## WS281x LED driver (built here, backport-ready)
+
+A second, independent body of work sharing this repo's fast-agentic-iteration setup:
+a multi-channel WS2811/WS2812 LED driver over the ESP32 family's RMT peripheral,
+destined for the same lp2025 backport as an `lp-fw/fw-esp32/src/output/rmt/`
+replacement. It has no dependency on the Xtensa backend above — the ESP32-C6 target
+is RISC-V — and is documented independently: architecture and alternatives in
+[the ADR](docs/adr/2026-07-31-ws281x-rmt-driver-architecture.md), the backport seam in
+[docs/BACKPORT.md](docs/BACKPORT.md), stress/telemetry data in that plan's
+`findings.md`.
+
+| Crate | What | Verified |
+|---|---|---|
+| `lp-ws281x` | Portable core: pulse encoding, bit-cursor ping-pong refill, guard-word flicker protection, the `RmtHw` backend trait — no chip in it | 59 host tests (63 all-features) against a mock RMT; on-silicon golden vectors from all three chips decode byte-identical to each other |
+| `led-lab-esp32s3` | ESP32-S3 (LX7) backend + lab firmware, 4 RMT TX channels | wire-level loopback self-test PASS (TX→RX via GPIO matrix, no wires); 4-channel soak 0 guard trips; 600 s stress soak: 0 % idle/logging, 1.04 % under a WiFi scan loop, 0.003 % under ESP-NOW, 0 errors/timeouts |
+| `led-lab-esp32` | Classic ESP32 (LX6) backend + lab firmware, up to 8 RMT TX channels — the deployment target | wire-level loopback self-test PASS; 8-channel TX soak; stress soak found genuine radio-starvation truncation (69 % under WiFi scan, 51 % under ESP-NOW) → **GO** on the Xtensa high-priority-interrupt follow-up; a separate ISR-throughput ceiling caps equal-length fan-out at 2 channels per memory block, root-caused via `irq_hz` measurement |
+| `led-lab-esp32c6` | ESP32-C6 (RISC-V) backend + lab firmware, 2 RMT TX channels | wire-level loopback self-test PASS; golden vector byte-identical to the S3's; stress soak clean except a WiFi scan loop (29 % truncation — fixed by raising interrupt priority, no assembly needed on RISC-V) |
+
 ## The spike (how it started)
 
 ## Why

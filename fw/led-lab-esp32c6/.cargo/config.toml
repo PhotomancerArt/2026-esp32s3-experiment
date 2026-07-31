@@ -1,0 +1,13 @@
+# RISC-V, not Xtensa: the ESP32-C6 core is RV32IMAC, so the target ships with
+# upstream Rust and needs neither the `esp` toolchain channel nor `-Zbuild-std`.
+[target.riscv32imac-unknown-none-elf]
+runner = "espflash flash --monitor --chip esp32c6"
+
+[env]
+ESP_LOG = "info"
+
+[build]
+target = "riscv32imac-unknown-none-elf"
+
+# `linkall.x` is added by `build.rs` (as on the S3 crate) rather than here, so it
+# is appended exactly once and stays last.

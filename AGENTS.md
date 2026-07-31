@@ -54,3 +54,40 @@ bootloader (aborted flash / board-info) recovers with `espflash reset --port …
 
 Flash: `cd fw/xt-runner-esp32s3` (or `fw/xt-runner-esp32`) `&& cargo run --release`
 (or `espflash flash --chip <esp32s3|esp32> --port <port> <elf>`).
+
+### WS281x LED driver boards (`lp-ws281x` + `fw/led-lab-*`)
+
+A third board joins the two above for this work: **ESP32-S3** (shared with
+`xt-runner-esp32s3`), **classic ESP32** (shared with `xt-runner-esp32`), and
+**ESP32-C6** (Seeed XIAO, RISC-V — this driver's origin chip, not used by the
+Xtensa work above).
+
+**Port names for all three are NOT stable — they have changed twice across
+this plan's phases** (e.g. the S3's port moved mid-session when a third board
+was plugged in; the classic's port string has appeared as both
+`/dev/cu.usbserial-1440` and `/dev/cu.usbserial-11440` in different phases'
+notes). Treat any port path recorded in a README, a plan file, or this file as
+a **stale example**, never a fact to reuse unchecked. Re-enumerate instead:
+
+1. List candidates: `ls /dev/cu.*` (macOS). USB-Serial-JTAG boards (S3, C6)
+   re-enumerate after flash/reset, so a port can also disappear and
+   reappear mid-session — the retry-on-open loop in `scripts/capture.py`
+   exists for exactly that.
+2. Confirm which candidate is which chip with `espflash board-info --port
+   <candidate>` (reports chip type, not just "a device answered") — never
+   assume from the path alone. The classic ESP32 is a plain USB-UART bridge
+   (no chip-id handshake at the OS level the way USB-CDC/JTAG boards have),
+   so this step is the only reliable check for it too.
+3. Only then flash or capture against that port.
+
+The loopback self-test (`test_loopback` feature, one per `fw/led-lab-*`
+crate) is this driver's standard oracle: it proves the whole chain — pulse
+encoding, ping-pong refill, guard word, per-channel timing/color-order — by
+routing each TX channel's own pin into an RMT RX channel through the GPIO
+matrix and asserting the decoded wire against the sent frame numerically, with
+**no wires, no strips, and no external instrument**. Prefer it over reasoning
+about a change from source; every phase of this plan used it (or the P6
+stress harness built on the same driver) as the actual gate before calling
+something done. See each `fw/led-lab-<chip>/README.md` for per-chip loopback
+routing and capacity notes, and `lp-ws281x/README.md` for what it proves on
+the host side.
