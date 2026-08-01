@@ -580,7 +580,11 @@ Load-bearing checks, all identical on both cores:
 
 ## Remains unverified on LX6 (stated, not implied away)
 
-- **FPU** — out of scope repo-wide (integer-only corpus, fixtures, emitter).
+- **FPU** — this sweep is LX6-scoped and doesn't touch it; classic silicon's FP
+  capability is unprobed here. (S3/LX7 FPU *presence* is now probed — see
+  "M6-P1 — FP capability probe" below — and full FP *behavior* is silicon-verified
+  in lp2025, not this repo. This repo's own corpus, fixtures, and emitter remain
+  integer-only regardless of chip.)
 - **Cycle counts / perf model** — out of scope for this repo.
 - Silicon execution covers the corpus's instruction subset; `imm.rs` entries
   the emitter does not currently emit (e.g. `bbci`, or `sext` at bit
@@ -593,3 +597,91 @@ Load-bearing checks, all identical on both cores:
   (RX path transiently needs ~3× the payload), not an ISA divergence; no
   corpus case comes near it (largest ~2.7KB), so no case was skipped for
   capacity.
+
+## M6-P1 — FP capability probe (S3, 2026-07-31)
+
+lp2025's f32 native-math roadmap (milestone M6, phase P1) needed to know which
+Xtensa Floating-Point Option instructions the desk S3 actually implements
+before building emulator executors for them. This repo answered that with
+real hardware, the same way E1–E5 and the classic-silicon chapters above
+answered the integer/window/ABI questions.
+
+**What ran**: `xt-runner-client/examples/fp_probe.rs` (+ its generated table,
+`fp_probes_table.rs`) replays 26 assembler-derived probe payloads — extracted
+from lp2025's `lp-xt/fixtures/fp/probe.S` (branch `claude/f32-m6-p1-xt-inst-fp`)
+by its `probes.sh` — against a resident `xt-runner-esp32s3`, one `load_exec`
+per probe, classified per `probe.S`'s own header rule: returns its staged id
+→ PRESENT (CP0 armed); `EXCCAUSE 32` → present, CPENABLE not armed;
+`EXCCAUSE 0` → ABSENT (illegal instruction); anything else → UNEXPECTED.
+
+**Provenance (commit `b1dff8f`, 2026-07-31)**, quoted verbatim — this commit
+message is the only record of the run committed to this repo; no raw
+per-probe capture or session log is committed alongside it:
+
+> Run on silicon 2026-07-31: all 26 PRESENT, zero crashes; CPENABLE arrives
+> armed under the esp-hal boot chain (provenance unpinned — not in
+> esp-hal/xtensa-lx-rt source); FCR/FSR reset to 0; FSR flags accumulate; the
+> whole div/sqrt helper family exists.
+
+### Verdict table
+
+Per that aggregate result, every probe in the committed table resolved
+PRESENT. What each probe targets (read off the probe name and the Xtensa FP
+ISA, not independently re-verified row-by-row here — see "Remains unverified"
+below):
+
+| probe | targets | verdict |
+|---|---|---|
+| `unarmed` | float op issued before CPENABLE is set (gate check) | PRESENT |
+| `add_s` | `add.s` | PRESENT |
+| `mul_s` | `mul.s` | PRESENT |
+| `madd_s` | `madd.s` (fused multiply-add) | PRESENT |
+| `abs_s` | `abs.s` | PRESENT |
+| `mov_s` | `mov.s` | PRESENT |
+| `rfr_wfr` | `rfr`/`wfr` (AR ↔ FR register moves) | PRESENT |
+| `oeq_bf` | `oeq.s` + `bf` (branch on BR false) | PRESENT |
+| `oeq_movt` | `oeq.s` + `movt` (conditional move on BR true) | PRESENT |
+| `oeq_rsr_br` | `oeq.s` + `rsr.br` + branch | PRESENT |
+| `movf_s` | `movf.s` (conditional FP move) | PRESENT |
+| `moveqz_s` | `moveqz.s` | PRESENT |
+| `float_trunc` | `float.s`/`trunc.s` (int↔float conversion) | PRESENT |
+| `lsi_ssi` | `lsi`/`ssi` (FP load/store, immediate offset) | PRESENT |
+| `lsx_ssx` | `lsx`/`ssx` (FP load/store, indexed) | PRESENT |
+| `div0_s` | `div0.s` | PRESENT |
+| `nexp01_s` | `nexp01.s` | PRESENT |
+| `const_s` | `const.s` | PRESENT |
+| `maddn_s` | `maddn.s` | PRESENT |
+| `mkdadj_s` | `mkdadj.s` | PRESENT |
+| `divn_s` | `divn.s` | PRESENT |
+| `recip0_s` | `recip0.s` | PRESENT |
+| `rsqrt0_s` | `rsqrt0.s` | PRESENT |
+| `sqrt0_s` | `sqrt0.s` | PRESENT |
+| `rur_fcr` | `rur` (read FCR user register) | PRESENT |
+| `rur_fsr` | `rur` (read FSR user register) | PRESENT |
+
+**Where the durable semantics live**: this probe answers presence/absence
+only — it says nothing about rounding-mode honoring, denormal handling, NaN
+propagation, or FSR flag correctness. lp2025 built and silicon-verified
+`lp-xt-inst`/`lp-xt-emu` FPU executors against 5,630 conformance vectors
+(zero divergence) plus ~503M measured estimate-ROM points; that behavior
+contract is recorded in lp2025's
+`docs/adr/2026-07-31-xtensa-fp-behavior-contract.md`. This repo's own
+`lp-xt-emu`/`lp-xt-inst` still decode only the integer subset (see
+`fixtures/README.md`) and gain no FPU executors from this probe.
+
+### Remains unverified
+
+- **No raw per-probe capture is committed in this repo** — the PRESENT
+  verdicts above are read off the commit message's summary of the silicon
+  run, not a transcript this doc can quote row-by-row. Treat the table above
+  as an inference from that summary, not an independently re-run result.
+- **LX6 (classic ESP32) FPU** — this sweep targeted the resident
+  `xt-runner-esp32s3` only; classic silicon was not probed (see "Remains
+  unverified on LX6" above).
+- **CPENABLE's armed-at-boot provenance** — confirmed armed under the
+  esp-hal boot chain, but the commit records it as not traceable to
+  esp-hal/xtensa-lx-rt source.
+- FP behavioral correctness beyond instruction presence (rounding, NaN
+  shape, FSR sticky-flag semantics, estimate-ROM contents) — out of scope
+  for this probe by design; that is lp2025's `lp-xt-emu` claim, not this
+  repo's.

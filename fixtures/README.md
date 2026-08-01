@@ -29,11 +29,17 @@ Chosen to sit inside `lp-xt-emu`'s modeled SRAM1 (see its `memory.rs`):
 
 ## The integer-only rule
 
-Fixtures must be integer-only: the emulator has **no FPU executors**, and the
-toolchain emits S3 FPU ops (`add.s`, …) for any `f32`/`f64`. Enforcement is
-**at runtime**: `lp-xt-inst` decodes only the integer subset, so an FPU (or
-any unsupported) instruction on an executed path raises an
-illegal-instruction trap and fails the fixture's test with the faulting PC.
+Fixtures must be integer-only: *this repo's* `lp-xt-emu`/`lp-xt-inst` have no
+FPU executors, and the toolchain emits S3 FPU ops (`add.s`, …) for any
+`f32`/`f64`. Enforcement is **at runtime**: `lp-xt-inst` decodes only the
+integer subset, so an FPU (or any unsupported) instruction on an executed
+path raises an illegal-instruction trap and fails the fixture's test with
+the faulting PC.
+
+(FP execution now exists elsewhere in the Xtensa stack: lp2025 built and
+silicon-verified its own `lp-xt-inst`/`lp-xt-emu` FPU executors — see its
+`docs/adr/2026-07-31-xtensa-fp-behavior-contract.md`. That work didn't touch
+this crate; this fixtures corpus stays integer-only.)
 
 Do not try to enforce it by grepping objdump output: objdump disassembles the
 literal pool at the head of `.text` as garbage "instructions" (`ule.s`,

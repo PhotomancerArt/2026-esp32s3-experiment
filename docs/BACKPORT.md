@@ -271,8 +271,14 @@ retired, so **one emitter and one ABI serve both chips**. Emitting the LX6-commo
 
 ## What is NOT proven here (carry as monorepo risk)
 
-- FPU executors (fixtures + emitter are integer-only; lightplayer's device path is
-  Q32, but `fw-emu-xt` running arbitrary fork-compiled code will need FPU in the emu).
+- **FPU executors — resolved, but not here.** This repo's own fixtures, emitter, and
+  `lp-xt-inst`/`lp-xt-emu` stay integer-only; the S3/LX7 capability question was
+  answered by this repo's M6-P1 probe (`xt-runner-client/examples/fp_probe.rs`, all 26
+  probed instructions PRESENT — FINDINGS.md, "M6-P1 — FP capability probe"), and the
+  full behavior contract was built and silicon-verified independently in lp2025's own
+  `lp-xt-inst`/`lp-xt-emu` (5,630 conformance vectors, zero divergence — its
+  `docs/adr/2026-07-31-xtensa-fp-behavior-contract.md`). Not a monorepo risk anymore;
+  classic LX6 FPU is the one still open (below).
 - Full `InstLog`/trace parity + cycle model (`lp-xt-emu` has hook points only).
 - The `lp-emu-core` extraction itself (monorepo refactor #2 — the prize is ~2× bigger
   now that `profile/` landed in lp-riscv-emu; see readiness report).
@@ -282,7 +288,9 @@ retired, so **one emitter and one ABI serve both chips**. Emitting the LX6-commo
   (word-mirrored SRAM1 writer, C2). Still open on classic: the runner firmware's
   near-cap payload OOM (RX path transiently needs ~3× the payload, so ~33KB payloads
   panic instead of answering `PayloadTooLarge` — firmware backlog, not an ISA issue),
-  and everything FPU (out of scope repo-wide).
+  and everything FPU: LX6 wasn't in scope for the S3/LX7 FPU work above (this repo's
+  M6-P1 probe and lp2025's behavior contract both), so classic FP capability is
+  genuinely unprobed anywhere, not just here.
 - Absolute-symbol `CALLX8` on device (emulator-only here; PC-relative `CALL8` is the
   device-proven path; a runtime-base-discovery probe worked but is fragile — see M5).
 - The MOVSP large-frame escape path (frames > 32752 bytes hard-error today).
